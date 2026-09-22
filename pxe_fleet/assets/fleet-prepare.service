@@ -1,0 +1,16 @@
+[Unit]
+Description=Prepare persistent storage and APT applications
+Wants=network-online.target
+After=network-online.target
+RequiresMountsFor=/appdata /var/lib/containers
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/lib/pxe-fleet-client.py prepare
+RemainAfterExit=yes
+TimeoutStartSec=1800
+Restart=on-failure
+RestartSec=60
+
+[Install]
+WantedBy=multi-user.target

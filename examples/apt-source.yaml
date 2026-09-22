@@ -1,0 +1,20 @@
+# Fragment to place under a client's apt mapping. This is a template, not a
+# working public repository: substitute your real URL and signing-key checksum.
+sources:
+  - name: my-application
+    url: https://packages.example.org/debian
+    suites: "{codename}"
+    components: main
+    key_url: https://packages.example.org/signing-key.asc
+    key_sha256: REPLACE_WITH_THE_64_HEX_SHA256_OF_THE_DOWNLOADED_KEY
+packages: [my-application]
+services: [my-application.service]
+users:
+  - name: my-application
+    uid: 2200
+    gid: 2200
+persistent:
+  - source: my-application
+    target: /var/lib/my-application
+    uid: 2200
+    gid: 2200

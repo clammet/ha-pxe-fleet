@@ -1,0 +1,41 @@
+# Copy into the add-on configuration directory as fleet.yaml.
+# Replace these documentation addresses with your reserved LAN addresses.
+server_ip: 192.0.2.10
+dns: [192.0.2.1]
+os_check_hours: 24
+app_update_minutes: 60
+boot_timeout_seconds: 900
+min_free_gib: 8
+overlay_size: 50%
+podman_size: 25%
+ssh_authorized_keys: []
+
+clients:
+  - serial: "1234abcd"
+    ip: 192.0.2.21
+    hostname: pi-worker
+    model: pi4
+    boot_options:
+      - dtparam=i2c_arm=on
+    apt:
+      # Stock OS repositories are already configured. Add third-party sources
+      # using the separate apt-source.yaml example.
+      packages: [mosquitto]
+      services: [mosquitto.service]
+      users:
+        - name: mosquitto
+          uid: 2100
+          gid: 2100
+      persistent:
+        - source: mosquitto
+          target: /var/lib/mosquitto
+          uid: 2100
+          gid: 2100
+    containers:
+      - name: web
+        image: docker.io/library/nginx:stable-alpine
+        ports: ["8080:80"]
+        environment: {}
+        # Volumes are opt-in. Here nginx uses its image's default website.
+        # Every configured volume source is relative to this Pi's appdata.
+        volumes: []

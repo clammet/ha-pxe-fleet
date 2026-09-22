@@ -1,0 +1,13 @@
+[Unit]
+Description=Report boot health and reconcile applications
+Wants=network-online.target fleet-prepare.service
+After=network-online.target
+RequiresMountsFor=/appdata
+
+[Service]
+ExecStart=/usr/bin/python3 /usr/local/lib/pxe-fleet-client.py agent
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target

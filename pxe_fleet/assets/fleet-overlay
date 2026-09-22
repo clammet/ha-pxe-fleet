@@ -1,0 +1,22 @@
+#!/bin/sh
+# initramfs-tools init-bottom hook; all backing mounts survive switch_root.
+# rootmnt is exported by initramfs-tools; kernel command-line words are intentional.
+# shellcheck disable=SC2154,SC2013
+case "${1:-}" in prereqs) exit 0;; esac
+# shellcheck disable=SC1091
+. /scripts/functions
+size=50%
+for arg in $(cat /proc/cmdline); do
+    case "$arg" in fleet.overlay=*) size=${arg#fleet.overlay=};; esac
+done
+modprobe overlay || panic "PXE Fleet: missing overlay module"
+mkdir -p /fleet/lower /fleet/writable
+mount --move "${rootmnt}" /fleet/lower || panic "PXE Fleet: moving NFS root failed"
+mount -t tmpfs -o "mode=0755,size=$size" tmpfs /fleet/writable || panic "PXE Fleet: RAM mount failed"
+mkdir -p /fleet/writable/upper /fleet/writable/work
+mount -t overlay overlay -o lowerdir=/fleet/lower,upperdir=/fleet/writable/upper,workdir=/fleet/writable/work "${rootmnt}" || panic "PXE Fleet: overlay mount failed"
+mkdir -p "${rootmnt}/.fleet"
+# Move the backing mounts under the new root before switch_root.
+mkdir -p "${rootmnt}/.fleet/lower" "${rootmnt}/.fleet/writable"
+mount --move /fleet/lower "${rootmnt}/.fleet/lower" || panic "PXE Fleet: lower mount move failed"
+mount --move /fleet/writable "${rootmnt}/.fleet/writable" || panic "PXE Fleet: upper mount move failed"
