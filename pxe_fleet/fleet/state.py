@@ -8,7 +8,9 @@ import threading
 import time
 
 from .build import prepare_client, stage_applications
-from .config import client_spec
+from .boot import sd_payload
+from .sdmedia import prepare_updates
+from .config import architecture, client_spec, kernel_flavor
 from .util import atomic_write, digest, run, write_json
 
 LOG = logging.getLogger(__name__)
@@ -16,7 +18,7 @@ LOG = logging.getLogger(__name__)
 
 def boot_config(client, generation):
     prefix = f"payloads/{generation}/"
-    lines = ["[all]", "arm_64bit=1", "enable_uart=1", "auto_initramfs=0",
+    lines = ["[all]", "arm_64bit=" + ("1" if architecture(client["model"]) == "arm64" else "0"), "enable_uart=1", "auto_initramfs=0",
              "os_prefix=" + prefix, "kernel=fleet-kernel", "initramfs fleet-initrd followkernel"]
     if client["model"] != "pi5":
         suffix = "4" if client["model"] == "pi4" else ""
@@ -56,10 +58,26 @@ class Store:
         entry = self.state["clients"][serial]
         return entry["pending"]["generation"] if entry["pending"] else entry["active"]
 
+    def sd_description(self, serial, generation, model):
+        if not generation or not self.state["clients"][serial]["client"].get("sd_updates", True):
+            return None
+        index = self.root(serial, generation) / "usr/lib/pxe-fleet/sd-updates/index.json"
+        if not index.exists():
+            return None
+        description = json.loads(index.read_text()).get(model)
+        return {**description, "generation": generation} if description else None
+
     def publish(self, serial, generation):
-        entry = self.state["clients"][serial]
         manifest = json.loads((self.root(serial, generation).parent / "manifest.json").read_text())
         atomic_write(self.path / "tftp" / serial / "config.txt", boot_config(manifest["client"], generation))
+        # Each route publishes one atomic pointer to a complete, immutable set.
+        # A reboot between these writes may select either complete generation.
+        sd = self.root(serial, generation) / "boot/firmware/sd-boot.env"
+        target = self.path / "tftp" / serial / "boot.env"
+        if sd.exists():
+            atomic_write(target, sd.read_bytes())
+        else:
+            target.unlink(missing_ok=True)
         LOG.info("Boot target %s -> %s", serial, generation)
 
     def recover(self):
@@ -97,13 +115,15 @@ class Store:
             stage_applications(root, spec)
             write_json(stage / "manifest.json", {"client": client, "generation": generation, "base": fingerprint, "created": time.time()}, 0o644)
             boot = root / "boot/firmware"
-            flavor = "2712" if client["model"] == "pi5" else "v8"
+            flavor = kernel_flavor(client["model"])
             shutil.copy2(boot / ("fleet-kernel-" + flavor), boot / "fleet-kernel")
             shutil.copy2(boot / ("fleet-initrd-" + flavor), boot / "fleet-initrd")
-            cmdline = (f"console=serial0,115200 console=tty1 root=/dev/nfs boot=nfs "
+            cmdline = (f"console=serial0,115200 console=tty1 root=/dev/nfs boot=fleet "
                        f"nfsroot={cfg['server_ip']}:{self.nfs_root(serial, generation)},vers=4.1,proto=tcp,ro "
                        f"ip=dhcp rw rootwait panic=30 fleet.overlay={cfg['overlay_size']}\n")
             atomic_write(boot / "cmdline.txt", cmdline)
+            sd_payload(boot, client, generation)
+            prepare_updates(root, spec)
             # A complete generation must be on disk before either NFS or TFTP sees it.
             run(["sync", "-f", stage])
             stage.rename(final)
@@ -154,7 +174,14 @@ class Store:
             if pending:
                 if pending["started"] is None and (not status.get("updating") or status["generation"] == pending["generation"]):
                     pending["started"] = now
-                if status["generation"] == pending["generation"] and status["healthy"]:
+                sd = status.get("sd") or {}
+                sd_target = self.sd_description(serial, pending["generation"], sd["model"]) if sd else None
+                sd_ready = not sd_target or sd.get("revision") == sd_target["revision"]
+                # An old failure report may arrive before the client receives
+                # an operator's retry request. Do not cancel that fresh attempt.
+                if sd.get("failed_generation") == pending["generation"] and sd.get("retry", 0) == entry.get("sd_retry", 0):
+                    self._rollback(serial)
+                elif status["generation"] == pending["generation"] and status["healthy"] and not sd.get("trial") and sd_ready:
                     entry["previous"] = entry["active"]
                     entry["active"] = pending["generation"]
                     entry["pending"] = None
@@ -163,7 +190,9 @@ class Store:
                     self._rollback(serial)
             self.save()
             desired = self.desired(serial)
-            return {"desired": desired, "reboot": bool(desired and desired != status["generation"] and not status.get("updating")), "nonce": status["nonce"]}
+            return {"desired": desired, "reboot": bool(desired and desired != status["generation"] and not status.get("updating")),
+                    "nonce": status["nonce"], "sd_retry": entry.get("sd_retry", 0),
+                    "sd_update": self.sd_description(serial, desired, status["sd"]["model"]) if status.get("sd") else None}
 
     def expire(self, timeout, now=None):
         now = time.time() if now is None else now

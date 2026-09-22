@@ -17,7 +17,7 @@ import time
 import yaml
 
 from .build import Builder
-from .config import validate
+from .config import architecture, validate
 from .images import discover
 from .state import Store
 from .util import atomic_write, canonical, run, write_json
@@ -27,6 +27,30 @@ LOG = logging.getLogger(__name__)
 
 def handler(store, cfg):
     class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            match = re.fullmatch(r"/v1/clients/([a-f0-9]{8})/sd/([a-f0-9]{24})/(pi1|pi2|pi3|pi3plus|pi4)", self.path)
+            if not match or match[1] not in store.state["clients"]:
+                self.send_error(404)
+                return
+            serial, generation, model = match.groups()
+            entry = store.state["clients"][serial]
+            signature = hmac.new(entry["token"].encode(), ("GET " + self.path).encode(), hashlib.sha256).hexdigest()
+            if self.client_address[0] != entry["client"]["ip"] or not hmac.compare_digest(signature, self.headers.get("X-Fleet-Signature", "")):
+                self.send_error(403)
+                return
+            path = store.root(serial, generation) / "usr/lib/pxe-fleet/sd-updates" / (model + ".img.gz")
+            try:
+                stream = path.open("rb")
+            except FileNotFoundError:
+                self.send_error(404)
+                return
+            with stream:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/gzip")
+                self.send_header("Content-Length", str(path.stat().st_size))
+                self.end_headers()
+                shutil.copyfileobj(stream, self.wfile, 1024 * 1024)
+
         def do_POST(self):
             match = re.fullmatch(r"/v1/clients/([a-f0-9]{8})", self.path)
             if not match or match[1] not in store.state["clients"]:
@@ -55,6 +79,18 @@ def handler(store, cfg):
                     raise ValueError("Invalid report")
                 if not store.root(serial, status["generation"]).exists():
                     raise ValueError("Unknown generation")
+                sd = status.get("sd")
+                if sd is not None:
+                    if (not isinstance(sd, dict) or sd.get("format") != 2
+                        or sd.get("model") not in ("pi1", "pi2", "pi3", "pi3plus", "pi4")
+                        or ("pi3" if sd["model"] == "pi3plus" else sd["model"]) != entry["client"]["model"]
+                        or sd.get("serial") != serial
+                        or not re.fullmatch(r"[a-f0-9]{32}", str(sd.get("card_id", "")))
+                        or not re.fullmatch(r"[a-f0-9]{64}", str(sd.get("revision", "")))
+                        or type(sd.get("trial")) is not bool
+                        or type(sd.get("retry")) is not int or sd["retry"] < 0
+                        or sd.get("failed_generation") is not None and not re.fullmatch(r"[a-f0-9]{24}", str(sd["failed_generation"]))):
+                        raise ValueError("Invalid SD boot report")
                 # Ignore replayed reports. Nonces are not persisted because they
                 # cannot authorize an arbitrary boot target, only report health.
                 with store.lock:
@@ -158,7 +194,6 @@ class Services:
 
 
 def reconcile(store, cfg, services, builder):
-    release = discover(cfg["image"])
     # A stale/offline client's last reported root stays protected. Only roots
     # unreferenced for a full week can be unexported and removed.
     with store.lock:
@@ -171,24 +206,27 @@ def reconcile(store, cfg, services, builder):
                 shutil.rmtree(store.path / "tftp" / serial / "payloads" / generation, ignore_errors=True)
                 store.state["clients"][serial]["retired"].pop(generation, None)
             store.save()
-    cache = store.path / "cache"
-    for file in cache.glob("*"):
-        if file.is_file() and file.stem != release["sha256"]:
-            file.unlink()
-    if shutil.disk_usage(store.path).free < cfg["min_free_gib"] * 1024 ** 3:
-        raise RuntimeError("Insufficient free space to stage an OS; current generations retained")
-    with builder.base(release) as (base, fingerprint):
-        for client in cfg["clients"]:
-            try:
-                if shutil.disk_usage(store.path).free < cfg["min_free_gib"] * 1024 ** 3:
-                    raise RuntimeError("Insufficient free space for another client generation")
-                generation = store.stage(cfg, client, base, fingerprint)
-                if generation:
-                    # Export before publishing a boot target or requesting reboot.
-                    services.exports()
-                    store.activate(client["serial"], generation)
-            except Exception:
-                LOG.exception("Failed to stage client %s; existing generation retained", client["serial"])
+    for arch in sorted({architecture(c["model"]) for c in cfg["clients"]}):
+        try:
+            release = discover(cfg["image" if arch == "arm64" else "image_armhf"], arch)
+            if shutil.disk_usage(store.path).free < cfg["min_free_gib"] * 1024 ** 3:
+                raise RuntimeError("Insufficient free space to stage an OS; current generations retained")
+            with builder.base(release, arch) as (base, fingerprint):
+                for client in cfg["clients"]:
+                    if architecture(client["model"]) != arch:
+                        continue
+                    try:
+                        if shutil.disk_usage(store.path).free < cfg["min_free_gib"] * 1024 ** 3:
+                            raise RuntimeError("Insufficient free space for another client generation")
+                        generation = store.stage(cfg, client, base, fingerprint)
+                        if generation:
+                            # Export before publishing a boot target or requesting reboot.
+                            services.exports()
+                            store.activate(client["serial"], generation)
+                    except Exception:
+                        LOG.exception("Failed to stage client %s; existing generation retained", client["serial"])
+        except Exception:
+            LOG.exception("Failed to build %s OS; existing generations retained", arch)
 
 
 def requests(store):
@@ -201,7 +239,9 @@ def requests(store):
                 if command == "check":
                     check = True
                 elif command == "retry":
-                    store.state["clients"][request["serial"]]["failed"] = []
+                    entry = store.state["clients"][request["serial"]]
+                    entry["failed"] = []
+                    entry["sd_retry"] = entry.get("sd_retry", 0) + 1
                     store.save()
                     check = True
                 elif command == "rollback":

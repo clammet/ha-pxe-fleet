@@ -36,22 +36,23 @@ def enable(root, unit, target="multi-user.target"):
     link.symlink_to("../" + unit)
 
 
-def ensure_emulation():
-    if platform.machine() == "aarch64":
+def ensure_emulation(arch="arm64"):
+    if arch == "arm64" and platform.machine() == "aarch64":
         return
-    if platform.machine() != "x86_64":
+    if platform.machine() not in ("x86_64", "aarch64"):
         raise RuntimeError("The builder requires an ARM64 or x86-64 Linux host")
     path = Path("/proc/sys/fs/binfmt_misc")
     if not (path / "register").exists():
         run(["mount", "-t", "binfmt_misc", "binfmt_misc", path])
     # Register only our interpreter, with F so it remains available inside chroots.
-    entry = path / "pxe-fleet-aarch64"
+    target = {"arm64": "aarch64", "armhf": "arm"}[arch]
+    entry = path / ("pxe-fleet-" + target)
     if not entry.exists():
-        interpreter = "/usr/bin/qemu-aarch64-static"
-        magic = b"\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\xb7\x00"
+        interpreter = f"/usr/bin/qemu-{target}-static"
+        magic = b"\x7fELF" + (b"\x02" if arch == "arm64" else b"\x01") + b"\x01\x01" + b"\x00" * 9 + b"\x02\x00" + (b"\xb7\x00" if arch == "arm64" else b"\x28\x00")
         mask = b"\xff\xff\xff\xff\xff\xff\xff\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff"
         with (path / "register").open("wb") as handle:
-            handle.write(b":pxe-fleet-aarch64:M::" + magic + b":" + mask + b":" + interpreter.encode() + b":F")
+            handle.write(b":pxe-fleet-" + target.encode() + b":M::" + magic + b":" + mask + b":" + interpreter.encode() + b":F")
 
 
 @contextmanager
@@ -72,12 +73,25 @@ def chroot(root, *args, output=False):
 
 
 def source_revision():
-    sources = [*ASSETS.glob("*"), *Path(__file__).parent.glob("*.py")]
-    return digest({p.name: images.file_hash(p) for p in sorted(sources) if p.is_file()})
+    sources = [*ASSETS.glob("*"), *Path(__file__).parent.glob("*.py"),
+               *(ASSETS.parent / "bootloader").glob("*.cmd"), *(ASSETS.parent / "bootloaders").glob("*/u-boot.bin")]
+    return digest({str(p.relative_to(ASSETS.parent)): images.file_hash(p) for p in sorted(sources) if p.is_file()})
 
 
-def build_base(release, root, cache, scratch):
-    ensure_emulation()
+def install_initramfs(root):
+    put(root, "etc/initramfs-tools/conf.d/fleet", "BOOT=fleet\nMODULES=most\nBUSYBOX=y\nCOMPRESS=gzip\n")
+    put(root, "etc/initramfs-tools/conf.d/resume", "RESUME=none\n")
+    for source, target in (
+        ("fleet-overlay", "etc/initramfs-tools/scripts/init-bottom/fleet-overlay"),
+        ("fleet-nfs", "etc/initramfs-tools/scripts/fleet"),
+        ("fleet-hook", "etc/initramfs-tools/hooks/fleet"),
+        ("fleet-nfsmount", "usr/local/lib/fleet-nfsmount"),
+    ):
+        put(root, target, (ASSETS / source).read_bytes(), 0o755)
+
+
+def build_base(release, root, cache, scratch, arch="arm64"):
+    ensure_emulation(arch)
     images.extract(images.image_file(release, cache), root, scratch)
     put(root, "usr/sbin/policy-rc.d", "#!/bin/sh\nexit 101\n", 0o755)
     put(root, "etc/resolv.conf", Path("/etc/resolv.conf").read_bytes())
@@ -88,12 +102,11 @@ def build_base(release, root, cache, scratch):
         chroot(root, "apt-get", "update", "--error-on=any")
         chroot(root, "apt-get", "-y", "-o", "Dpkg::Options::=--force-confold", "dist-upgrade")
         chroot(root, "apt-get", "-y", "--no-install-recommends", "install", "initramfs-tools", "busybox", "nfs-common", "python3", "ca-certificates", "gnupg", "podman", "openssh-server")
-        put(root, "etc/initramfs-tools/scripts/init-bottom/fleet-overlay", (ASSETS / "fleet-overlay").read_bytes(), 0o755)
-        put(root, "etc/initramfs-tools/hooks/fleet", (ASSETS / "fleet-hook").read_bytes(), 0o755)
-        if chroot(root, "dpkg", "--print-architecture", output=True) != "arm64":
-            raise RuntimeError("Expected an ARM64 root image")
+        install_initramfs(root)
+        if chroot(root, "dpkg", "--print-architecture", output=True) != arch:
+            raise RuntimeError(f"Expected an {arch} root image")
         versions = chroot(root, "dpkg-query", "-W", "-f=${Package}=${Version}\n", output=True)
-        for flavor in ("v8", "2712"):
+        for flavor in (("v8", "2712") if arch == "arm64" else ("v6", "v7")):
             kernels = sorted(p.name for p in (root / "lib/modules").iterdir() if p.name.endswith("-rpi-" + flavor))
             if not kernels:
                 raise RuntimeError(f"No installed Raspberry Pi {flavor} kernel")
@@ -135,6 +148,8 @@ def prepare_client(root, spec, generation, token, data_export):
     config = {**spec, "generation": generation, "token": token}
     put(root, "etc/pxe-fleet.json", json.dumps(config), 0o600)
     put(root, "usr/local/lib/pxe-fleet-client.py", Path(__file__).with_name("client.py").read_bytes(), 0o755)
+    for source, target in (("sdclient.py", "fleet_sd.py"), ("sd_layout.py", "fleet_sd_layout.py")):
+        put(root, "usr/local/lib/" + target, Path(__file__).with_name(source).read_bytes())
     put(root, "etc/hostname", spec["hostname"] + "\n")
     put(root, "etc/hosts", f"127.0.0.1 localhost\n127.0.1.1 {spec['hostname']}\n::1 localhost\n")
     put(root, "etc/resolv.conf", "".join(f"nameserver {ip}\n" for ip in spec["dns"]))
@@ -191,16 +206,19 @@ class Builder:
                 shutil.rmtree(path)
 
     @contextmanager
-    def base(self, release):
-        cache = self.storage / "cache"
+    def base(self, release, arch="arm64"):
+        cache = self.storage / "cache" / arch
         cache.mkdir(parents=True, exist_ok=True)
+        for file in cache.iterdir():
+            if file.is_file() and file.stem != release["sha256"]:
+                file.unlink()
         scratch = self.storage / "build"
         scratch.mkdir(parents=True, exist_ok=True)
         work = Path(tempfile.mkdtemp(prefix="base-", dir=scratch))
         try:
             root = work / "root"
             LOG.info("Building OS from %s", release["url"])
-            fingerprint = build_base(release, root, cache, work)
+            fingerprint = build_base(release, root, cache, work, arch)
             yield root, fingerprint
         finally:
             # Never recursively remove a chroot with live bind mounts, including

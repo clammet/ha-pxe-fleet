@@ -10,6 +10,14 @@ class ConfigError(ValueError):
     pass
 
 
+def architecture(model):
+    return "armhf" if model in ("pi1", "pi2") else "arm64"
+
+
+def kernel_flavor(model):
+    return {"pi1": "v6", "pi2": "v7", "pi3": "v8", "pi4": "v8", "pi5": "2712"}[model]
+
+
 def fail(message):
     raise ConfigError(message)
 
@@ -78,7 +86,7 @@ def target_path(value):
 
 def validate(raw):
     cfg = copy.deepcopy(raw)
-    keys(cfg, "server_ip control_port os_check_hours app_update_minutes boot_timeout_seconds min_free_gib overlay_size podman_size dns ssh_authorized_keys image clients", "fleet")
+    keys(cfg, "server_ip control_port os_check_hours app_update_minutes boot_timeout_seconds min_free_gib overlay_size podman_size dns ssh_authorized_keys image image_armhf clients", "fleet")
     cfg["server_ip"] = ipv4(cfg.get("server_ip"))
     for key, default, low, high in (
         ("control_port", 8099, 1024, 65535), ("os_check_hours", 24, 1, 720),
@@ -92,24 +100,27 @@ def validate(raw):
     if not cfg["dns"]:
         fail("At least one DNS server is required")
     cfg["ssh_authorized_keys"] = [line(v, "SSH public key") for v in array(cfg.get("ssh_authorized_keys", []), "ssh_authorized_keys")]
-    image = cfg.setdefault("image", {})
-    keys(image, "url sha256", "image")
-    if image:
-        https(image.get("url"))
-        string(image.get("sha256"), r"[a-fA-F0-9]{64}", "image.sha256")
-        image["sha256"] = image["sha256"].lower()
+    for field in ("image", "image_armhf"):
+        image = cfg.setdefault(field, {})
+        keys(image, "url sha256", field)
+        if image:
+            https(image.get("url"))
+            string(image.get("sha256"), r"[a-fA-F0-9]{64}", field + ".sha256")
+            image["sha256"] = image["sha256"].lower()
     clients = array(cfg.get("clients"), "clients")
     if not clients:
         fail("Configure at least one client")
     serials, ips, hosts = set(), set(), set()
     for c in clients:
-        keys(c, "serial ip hostname model boot_options apt containers", "client")
+        keys(c, "serial ip hostname model boot_options sd_updates apt containers", "client")
+        if type(c.setdefault("sd_updates", True)) is not bool:
+            fail("sd_updates must be a boolean")
         serial = string(c.get("serial"), r"(?:0x)?[a-fA-F0-9]{8,16}", "serial").lower().removeprefix("0x")[-8:]
         c["serial"] = serial
         c["ip"] = ipv4(c.get("ip"))
         string(c.get("hostname"), r"[a-z][a-z0-9-]{0,62}", "hostname")
-        if c.get("model") not in ("pi3", "pi4", "pi5"):
-            fail("model must be pi3, pi4 or pi5")
+        if c.get("model") not in ("pi1", "pi2", "pi3", "pi4", "pi5"):
+            fail("model must be pi1, pi2, pi3, pi4 or pi5")
         if serial in serials or c["ip"] in ips or c["hostname"] in hosts or c["ip"] == cfg["server_ip"]:
             fail("Serial suffixes, IP addresses and hostnames must be unique")
         serials.add(serial); ips.add(c["ip"]); hosts.add(c["hostname"])
@@ -117,6 +128,8 @@ def validate(raw):
         for opt in array(opts, "boot_options"):
             # Boot routing is controller-owned. Expose only board/peripheral settings.
             string(opt, r"(?:dtparam|dtoverlay|gpu_mem|enable_uart|force_turbo|arm_freq)=[a-zA-Z0-9_,.=-]+", "boot option")
+            if c["sd_updates"] and c["model"] != "pi5" and opt.startswith("gpu_mem=") and opt != "gpu_mem=32":
+                fail("Automatic SD updates require gpu_mem=32; disable sd_updates for another native-boot layout")
         apt = c.setdefault("apt", {})
         keys(apt, "sources packages services persistent users", "apt")
         for key in ("sources", "packages", "services", "persistent", "users"):
@@ -198,4 +211,4 @@ def validate(raw):
 
 
 def client_spec(cfg, client):
-    return {**client, **{k: cfg[k] for k in ("server_ip", "control_port", "app_update_minutes", "overlay_size", "podman_size", "dns", "ssh_authorized_keys")}}
+    return {**client, **{k: cfg[k] for k in ("server_ip", "control_port", "app_update_minutes", "boot_timeout_seconds", "overlay_size", "podman_size", "dns", "ssh_authorized_keys")}}

@@ -3,10 +3,27 @@
 ## Supported systems and setup
 
 The add-on runs on ARM64 or x86-64 Linux Home Assistant hosts and provisions
-ARM64 Pi 3, Pi 4 and Pi 5 clients with wired Ethernet. `pi3` covers 3B/3B+;
-3B needs network boot enabled in its OTP configuration. Pi 4/5 require an EEPROM
-boot order that includes network boot. Other boards and SD-assisted U-Boot boot
-are outside this initial implementation.
+Pi 1/2 clients with 32-bit Raspberry Pi OS and Pi 3/4/5 with 64-bit OS, using
+wired Ethernet. `pi3` covers 3B/3B+. Optional
+[SD retry cards](../boot-media/README.md) support Pi 1B/B+, Pi 2B, Pi 3B/3B+
+and Pi 4B and wait for HA to become available without routine card writes.
+Format-v2 cards automatically update firmware/U-Boot in an inactive slot, verify
+it, and use a one-shot trial boot before committing after health confirmation.
+Earlier single-partition cards need a one-time reflash; they are never repartitioned
+automatically. Set `sd_updates: false` on a client to disable card updates.
+
+Native Ethernet boot remains available on capable boards: Pi 3B needs network
+boot enabled in its OTP configuration; Pi 4/5 require an EEPROM boot order that
+includes network boot. Pi 1 and early Pi 2 cannot boot directly from Ethernet.
+For SD boot, configure a DHCP reservation and embed the HA server address in the
+card; no DHCP PXE options are needed. Pi 3B+ uses `pi3plus` in the card builder
+and `pi3` in `fleet.yaml`. Pi 5 currently supports only the native route.
+
+Client `boot_options` control the native route's firmware settings. For SD boot,
+supply peripheral options to the card builder with `--boot-option`; firmware
+loads them before U-Boot. Subsequent automatic slot updates apply the client
+`boot_options` using overlays from the target OS. Keep first-boot card options
+and fleet configuration aligned. SD boot requires the reserved `gpu_mem=32` layout.
 
 The public add-on configuration directory is exposed as `/config` inside the
 add-on and usually as `addon_configs/<repository-id>_pxe_fleet` through Home
@@ -42,13 +59,16 @@ not a secure-boot system. Root exports are restricted to each reserved address.
 | `podman_size` | `25%` | Maximum RAM filesystem size for container storage |
 | `control_port` | 8099 | Signed client report/reboot endpoint |
 | `ssh_authorized_keys` | `[]` | Root SSH public keys; SSH is disabled when empty |
-| `image` | `{}` | Optional fixed HTTPS image URL and SHA256 |
+| `image` | `{}` | Optional fixed ARM64 HTTPS image URL and SHA256 |
+| `image_armhf` | `{}` | Optional fixed 32-bit Raspberry Pi OS image URL and SHA256 for Pi 1/2 |
 
 The two RAM limits are independent ceilings, not reservations. Processes still
 need memory. A Pi 3 with 1 GB RAM is suitable only for small packages and images;
 large installations can exhaust RAM. No swap is configured. Start with one Pi
 and measure the workload before deploying a fleet. Allow roughly 15 GB for build
-workspace/cache, plus several GB per retained client generation. All server data
+workspace/cache per OS architecture, plus several GB per retained client generation.
+Pi 1 needs ARMv6-compatible packages/images and very small workloads; ordinary
+Debian ARMv7-only `armhf` binaries are not compatible with it. All server data
 lives in the add-on's `/data/fleet` on local storage, never on a remote NFS mount.
 
 ## APT applications
@@ -120,18 +140,26 @@ The auth file persists across OS resets; Quadlets and auto-update both use it.
 
 ## Update and recovery behavior
 
-1. Discover the current official ARM64 Lite release through Raspberry Pi's latest
-   URL and verify its matching SHA256. A pinned `image: {url, sha256}` disables
-   release discovery while keeping APT OS updates enabled.
+1. Discover the current official Lite release for each configured architecture
+   through Raspberry Pi's latest URL and verify its matching SHA256. Pinning
+   `image: {url, sha256}` (ARM64) or `image_armhf: {url, sha256}` disables discovery
+   for that architecture while keeping APT OS updates enabled.
 2. Extract a clean image into private local storage. Run OS APT upgrades offline,
    install client prerequisites, and build initramfs images for both Pi kernel
-   families. On x86-64, ARM64 maintainer scripts run through QEMU binfmt.
+   families (v6/v7 for Pi 1/2, v8/2712 for Pi 3/4/5). Cross-architecture
+   maintainer scripts run through QEMU binfmt. Each architecture has its own cache
+   and build; a failed 32-bit build does not prevent a 64-bit update.
 3. Fingerprint the upstream image, base package versions, builder and client
    configuration. An unchanged result causes no reboot or generation creation.
 4. Copy the prepared OS into a new per-client generation and install its APT
    sources, service accounts and application packages offline. Export it read-only and
    publish a complete immutable TFTP payload. An atomic `config.txt` selects the
    payload using `os_prefix`, including its matching kernel, modules and initramfs.
+   SD loaders read an atomic `boot.env` pointing to the same immutable generation,
+   with a U-Boot-compatible kernel plus file sizes and SHA256 hashes. Changed SD
+   firmware/device trees/U-Boot are staged in the inactive card slot before reboot;
+   an SD trial cannot confirm the OS until the boot slot is committed. NFS root
+   mounting retries indefinitely if exports are not ready yet.
 5. The running client receives a signed reboot request. It finishes any running
    application update first. After reboot, mounts and apps must be ready and the
    declared services active for at least 60 seconds before confirmation.
@@ -139,7 +167,10 @@ The auth file persists across OS resets; Quadlets and auto-update both use it.
    the failed candidate. A still-running agent reboots into the fallback. A board
    stuck before the agent starts may need a power cycle; changing a boot target
    alone cannot reset hung hardware. Kernel panic and systemd watchdog policies
-   cover some, but not all, failure modes.
+   cover some, but not all, failure modes. SD firmware-only trials have the same
+   `boot_timeout_seconds` deadline even without an OS rollout. A failed trial
+   retains the old selector and is quarantined; the retry command below also
+   releases SD quarantine. See the SD guide for recovery-layer and EEPROM limits.
 
 Offline clients do not start the rollout timer until they report. On first
 deployment there is no known-good generation; failed preparation retries without

@@ -19,6 +19,19 @@ def config():
 
 
 class ConfigTests(unittest.TestCase):
+    def test_sd_options_require_valid_boolean_and_reserved_memory(self):
+        cfg = config()
+        client = cfg["clients"][0]
+        client["sd_updates"] = "false"
+        with self.assertRaises(ConfigError):
+            validate(cfg)
+        client["sd_updates"] = True
+        client["boot_options"] = ["gpu_mem=128"]
+        with self.assertRaises(ConfigError):
+            validate(cfg)
+        client["sd_updates"] = False
+        self.assertEqual(validate(cfg)["clients"][0]["boot_options"], ["gpu_mem=128"])
+
     def test_serial_normalization_and_collision(self):
         cfg = config()
         self.assertEqual(cfg["clients"][0]["serial"], "1234abcd")
@@ -86,6 +99,7 @@ class RolloutTests(unittest.TestCase):
             root = self.store.root(self.serial, generation)
             (root / "boot/firmware").mkdir(parents=True)
             (root / "important").write_text(generation)
+            (root / "boot/firmware/sd-boot.env").write_text("fleet_generation=" + generation + "\n")
             write_json(root.parent / "manifest.json", {"client": self.client, "created": 0})
         entry = self.store.state["clients"][self.serial]
         entry["active"] = self.old
@@ -105,6 +119,7 @@ class RolloutTests(unittest.TestCase):
         restarted = Store(self.store.path)
         restarted.recover()
         self.assertEqual(restarted.desired(self.serial), self.new)
+        self.assertIn(self.new, (self.store.path / "tftp" / self.serial / "boot.env").read_text())
         self.store.report(self.serial, self.report(self.new, True), 900, now=200)
         self.assertEqual(self.store.state["clients"][self.serial]["active"], self.new)
         self.assertEqual(self.store.state["clients"][self.serial]["previous"], self.old)
@@ -119,6 +134,7 @@ class RolloutTests(unittest.TestCase):
         self.assertIn(self.new, self.store.state["clients"][self.serial]["failed"])
         self.assertIn("payloads/" + self.old, (self.store.path / "tftp" / self.serial / "config.txt").read_text())
         self.assertEqual(self.data.read_text(), "precious")
+        self.assertIn(self.old, (self.store.path / "tftp" / self.serial / "boot.env").read_text())
 
     def test_offline_client_and_ongoing_apt_update_do_not_expire(self):
         self.store.activate(self.serial, self.new)
@@ -135,6 +151,44 @@ class RolloutTests(unittest.TestCase):
         self.store.report(self.serial, self.report(self.new), 120, now=0)
         self.store.expire(120, now=121)
         self.assertEqual(self.store.desired(self.serial), self.new)
+
+    def test_sd_trial_cannot_confirm_os_and_failure_rolls_back_immediately(self):
+        self.store.activate(self.serial, self.new)
+        status = {**self.report(self.new, True), "sd": {"model": "pi4", "trial": True}}
+        self.store.report(self.serial, status, 900, now=100)
+        self.assertEqual(self.store.state["clients"][self.serial]["active"], self.old)
+        status["sd"]["failed_generation"] = self.new
+        self.store.report(self.serial, status, 900, now=101)
+        self.assertEqual(self.store.desired(self.serial), self.old)
+        self.assertEqual(self.data.read_text(), "precious")
+
+    def test_os_confirmation_waits_for_required_sd_revision(self):
+        directory = self.store.root(self.serial, self.new) / "usr/lib/pxe-fleet/sd-updates"
+        directory.mkdir(parents=True)
+        write_json(directory / "index.json", {"pi4": {"revision": "d" * 64}})
+        self.store.activate(self.serial, self.new)
+        status = {**self.report(self.new, True), "sd": {"model": "pi4", "trial": False, "revision": "c" * 64}}
+        self.store.report(self.serial, status, 900, now=100)
+        self.assertEqual(self.store.state["clients"][self.serial]["active"], self.old)
+        status["sd"].update(revision="d" * 64, trial=True)
+        self.store.report(self.serial, status, 900, now=101)
+        self.assertEqual(self.store.state["clients"][self.serial]["active"], self.old)
+        status["sd"]["trial"] = False
+        self.store.report(self.serial, status, 900, now=102)
+        self.assertEqual(self.store.state["clients"][self.serial]["active"], self.new)
+
+    def test_retry_does_not_accept_failure_from_before_client_received_it(self):
+        entry = self.store.state["clients"][self.serial]
+        entry["sd_retry"] = 1
+        self.store.activate(self.serial, self.new)
+        status = {**self.report(self.old, True), "sd": {"model": "pi4", "trial": False,
+                  "retry": 0, "failed_generation": self.new}}
+        reply = self.store.report(self.serial, status, 900, now=100)
+        self.assertEqual(reply["sd_retry"], 1)
+        self.assertEqual(reply["desired"], self.new)
+        status["sd"]["retry"] = 1
+        self.store.report(self.serial, status, 900, now=101)
+        self.assertEqual(self.store.desired(self.serial), self.old)
 
     def test_gc_preserves_offline_reported_root_and_grace_period(self):
         entry = self.store.state["clients"][self.serial]

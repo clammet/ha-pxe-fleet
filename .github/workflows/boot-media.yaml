@@ -1,0 +1,44 @@
+name: Build SD boot media
+on:
+  workflow_dispatch:
+    inputs:
+      serial:
+        description: Pi serial (8-16 hex digits; used for every model artifact)
+        required: true
+        type: string
+      server:
+        description: Home Assistant reserved IPv4 address
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  sd-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        model: [pi1, pi2, pi3, pi3plus, pi4]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: boot-media/.cache
+          key: sd-source-${{ runner.os }}-${{ matrix.model }}-${{ hashFiles('pxe_fleet/bootloader/build-tools.sh', 'boot-media/scripts/prepare.py') }}
+      - name: Compile U-Boot
+        env:
+          MODEL: ${{ matrix.model }}
+        run: ./boot-media/build.sh "$MODEL"
+      - name: Prepare SD image
+        env:
+          MODEL: ${{ matrix.model }}
+          PI_SERIAL: ${{ inputs.serial }}
+          SERVER_IP: ${{ inputs.server }}
+        run: ./boot-media/prepare.sh --model "$MODEL" --serial "$PI_SERIAL" --server "$SERVER_IP"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sd-boot-${{ matrix.model }}
+          path: boot-media/out/*-${{ matrix.model }}/
+          if-no-files-found: error
+          retention-days: 14

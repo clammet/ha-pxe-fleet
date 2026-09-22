@@ -1,0 +1,16 @@
+#!/bin/sh
+# initramfs-tools BOOT=fleet driver. Retain the distribution's DHCP/NFS parsing
+# and hooks, but retry the whole operation instead of stopping after 180 tries.
+# shellcheck disable=SC1091
+. /scripts/nfs
+
+mountroot()
+{
+    nfs_top
+    modprobe af_packet
+    wait_for_udev 10
+    while ! nfs_mount_root_impl; do
+        echo "PXE Fleet: network/NFS root unavailable; retrying in 10 seconds" >&2
+        sleep 10
+    done
+}

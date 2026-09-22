@@ -1,5 +1,5 @@
 name: Raspberry Pi PXE Fleet
-version: "0.1.0"
+version: "0.3.0"
 slug: pxe_fleet
 description: Replaceable network-boot OS generations with persistent app data, APT and Podman.
 url: https://github.com/clammet/ha-pxe-fleet

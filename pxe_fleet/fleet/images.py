@@ -9,7 +9,7 @@ import urllib.request
 
 from .util import capture, run
 
-LATEST = "https://downloads.raspberrypi.com/raspios_lite_arm64_latest"
+LATEST = {arch: f"https://downloads.raspberrypi.com/raspios_lite_{arch}_latest" for arch in ("arm64", "armhf")}
 
 
 def open_url(url, method="GET"):
@@ -21,12 +21,13 @@ def open_url(url, method="GET"):
     return response
 
 
-def discover(pinned=None):
+def discover(pinned=None, arch="arm64"):
+    latest = LATEST[arch]
     if pinned:
         return dict(pinned)
-    with open_url(LATEST, "HEAD") as response:
+    with open_url(latest, "HEAD") as response:
         url = response.url
-    if not re.fullmatch(r"https://downloads\.raspberrypi\.(?:com|org)/raspios_lite_arm64/images/[^\s]+\.img\.xz", url):
+    if not re.fullmatch(r"https://downloads\.raspberrypi\.(?:com|org)/raspios_lite_" + arch + r"/images/[^\s]+\.img\.xz", url):
         raise ValueError(f"Unexpected Raspberry Pi image URL: {url}")
     with open_url(url + ".sha256") as response:
         checksum = response.read(4096).decode().strip()

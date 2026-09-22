@@ -1,0 +1,4 @@
+#!/bin/sh
+# nfs-utils implements NFSv4; klibc nfsmount does not. The boot script owns
+# retries so it can retry DHCP too if the network disappeared after U-Boot.
+exec /sbin/mount.nfs "$@" -o retry=0

@@ -14,7 +14,13 @@ clients:
   - serial: "1234abcd"
     ip: 192.0.2.21
     hostname: pi-worker
+    # pi1/pi2 select 32-bit OS; pi3/pi4/pi5 select 64-bit OS.
+    # A Pi 3B+ uses pi3 here and pi3plus in the SD card builder.
     model: pi4
+    # Format-v2 SD cards automatically update firmware/U-Boot through A/B slots.
+    # Native clients never write an inserted SD card.
+    sd_updates: true
+    # For the first SD boot, also pass peripheral options when making the card.
     boot_options:
       - dtparam=i2c_arm=on
     apt:

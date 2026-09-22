@@ -16,6 +16,7 @@ from fleet.client import exchange, data_directory, apt_install
 from fleet.server import handler
 from fleet.state import Store
 from fleet.util import canonical
+from fleet.sdclient import download
 from test_fleet import config
 
 
@@ -74,6 +75,28 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError) as error:
             exchange(self.spec, {**self.status(), "generation": "e" * 24})
         self.assertEqual(error.exception.code, 400)
+
+    def test_sd_download_requires_authentication_and_matches_signed_description(self):
+        directory = self.store.root(self.serial, self.generation) / "usr/lib/pxe-fleet/sd-updates"
+        directory.mkdir(parents=True)
+        payload = b"compressed-firmware-placeholder"
+        (directory / "pi4.img.gz").write_bytes(payload)
+        description = {"format": 2, "model": "pi4", "serial": self.serial, "revision": "d" * 64,
+                       "sha256": hashlib.sha256(payload).hexdigest(), "size": len(payload),
+                       "raw_size": 64 * 1024**2, "raw_sha256": "e" * 64}
+        (directory / "index.json").write_bytes(canonical({"pi4": description}))
+        status = {**self.status(), "sd": {"format": 2, "model": "pi4", "serial": self.serial,
+                  "card_id": "a" * 32, "revision": "b" * 64, "trial": False, "retry": 0, "failed_generation": None}}
+        reply = exchange(self.spec, status)
+        self.assertEqual(reply["sd_update"], {**description, "generation": self.generation})
+        destination = Path(self.temp.name) / "download"
+        download(self.spec, reply["sd_update"], destination)
+        self.assertEqual(destination.read_bytes(), payload)
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            download({**self.spec, "token": "wrong"}, reply["sd_update"], destination)
+        self.assertEqual(error.exception.code, 403)
+        with self.assertRaisesRegex(ValueError, "checksum"):
+            download(self.spec, {**reply["sd_update"], "sha256": "0" * 64}, destination)
 
 
 class ClientTests(unittest.TestCase):

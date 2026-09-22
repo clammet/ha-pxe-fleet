@@ -22,6 +22,7 @@ root.mkdir(parents=True, exist_ok=True)
 write_json(root.parent / "manifest.json", {"client": cfg["clients"][0]})
 services = Services(store, cfg)
 mounts = []
+retry = None
 try:
     services.start()
     time.sleep(2)
@@ -30,6 +31,29 @@ try:
     services = Services(store, cfg)
     services.start()
     services.check()
+    # TFTP/controller startup can precede NFS exports. Exercise the actual retry
+    # driver against a missing export, then make it available without restarting
+    # the client process. Only distro DHCP discovery is stubbed in this container.
+    late = "b" * 24
+    lateroot = store.root("12345678", late)
+    lateroot.mkdir(parents=True, exist_ok=True)
+    (lateroot / "ready").write_text("late NFS export")
+    Path("/mnt/late").mkdir(exist_ok=True)
+    Path("/scripts").mkdir(exist_ok=True)
+    Path("/scripts/nfs").write_text(
+        'nfs_top() { :; }\nmodprobe() { :; }\nwait_for_udev() { :; }\n'
+        'nfs_mount_root_impl() { sh /workspace/pxe_fleet/assets/fleet-nfsmount '
+        f'-o vers=4.1,ro {ip}:/12345678/roots/{late} /mnt/late; }}\n')
+    retry = subprocess.Popen(["sh", "-c", ". /workspace/pxe_fleet/assets/fleet-nfs; mountroot"], stderr=subprocess.PIPE, text=True)
+    time.sleep(2)
+    assert retry.poll() is None, "Client did not keep waiting for NFS"
+    write_json(lateroot.parent / "manifest.json", {"client": cfg["clients"][0]})
+    services.exports()
+    mounts.append("/mnt/late")
+    _, retry_log = retry.communicate(timeout=45)
+    assert retry.returncode == 0, retry_log
+    assert "retrying" in retry_log
+    assert Path("/mnt/late/ready").read_text() == "late NFS export"
     for name in ("lower", "upper", "merged", "data"):
         Path("/mnt/" + name).mkdir(exist_ok=True)
     run(["mount", "-t", "nfs", "-o", "vers=4.1,ro", f"{ip}:/12345678/roots/{generation}", "/mnt/lower"])
@@ -65,8 +89,11 @@ try:
     (store.path / "tftp/probe").write_text("boot payload")
     result = subprocess.check_output(["curl", "--fail", "--silent", f"tftp://{ip}/probe"], text=True)
     assert result == "boot payload"
-    print("NFSv4 read-only root, RAM overlay, persistent data, and TFTP passed", flush=True)
+    print("Late NFS retry, NFSv4 read-only root, RAM overlay, persistent data, and TFTP passed", flush=True)
 finally:
+    if retry is not None and retry.poll() is None:
+        retry.kill()
+        retry.wait()
     for mount in reversed(mounts):
         run(["umount", "--recursive", mount])
     services.close()

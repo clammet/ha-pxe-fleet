@@ -226,7 +226,12 @@ def update_apps(spec):
 
 
 def agent(spec):
+    if __package__:
+        from .sdclient import detect
+    else:
+        from fleet_sd import detect
     boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    sd = detect(spec, boot_id)
     next_update = time.monotonic()
     future = None
     error = None
@@ -244,19 +249,29 @@ def agent(spec):
                     error = str(exc)
                     LOG.exception("Application update failed; will retry")
                 future = None
-            status = {"generation": spec["generation"], "boot_id": boot_id,
-                      "healthy": bool(healthy_since and time.monotonic() - healthy_since >= 60),
-                      "update_error": error, "updating": future is not None}
-            reply = exchange(spec, status)
-            if reply.get("reboot") and (not future or future.done()):
-                LOG.info("Rebooting into generation %s", reply["desired"])
+            # The local deadline also works if the control endpoint disappears
+            # after a firmware-only trial. Finish any in-flight app update first.
+            if sd and future is None and sd.expire_trial():
                 run(["systemctl", "reboot"], timeout=30)
+                time.sleep(60)
+                continue
+            stable = bool(healthy_since and time.monotonic() - healthy_since >= 60)
+            status = {"generation": spec["generation"], "boot_id": boot_id,
+                      "healthy": stable and not (sd and sd.trial),
+                      "update_error": error, "updating": future is not None}
+            if sd:
+                status["sd"] = sd.report()
+            reply = exchange(spec, status)
+            action = sd.handle(reply, stable) if sd and future is None else ("wait" if future else "ready")
+            if action in ("tryboot", "reboot") or reply.get("reboot") and action == "ready":
+                LOG.info("Rebooting into generation %s", reply["desired"])
+                run(["systemctl", "reboot"] + (["--reboot-argument=0 tryboot"] if action == "tryboot" else []), timeout=30)
                 time.sleep(60)
             if ready and future is None and time.monotonic() >= next_update:
                 future = executor.submit(update_apps, spec)
                 next_update = time.monotonic() + spec["app_update_minutes"] * 60
         except Exception:
-            LOG.exception("Controller exchange failed; running applications are retained")
+            LOG.exception("Fleet reconciliation failed; running applications are retained")
         time.sleep(30)
 
 
