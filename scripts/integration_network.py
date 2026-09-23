@@ -1,8 +1,10 @@
-"""Exercise real NFSv4, writable overlays and TFTP in an isolated container."""
+"""Exercise writable NFS roots, NFS-backed Podman storage and TFTP in isolation."""
 from pathlib import Path
 import subprocess
 import sys
 import time
+import tarfile
+import os
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "pxe_fleet"))
 from fleet.config import validate
@@ -11,14 +13,14 @@ from fleet.state import Store
 from fleet.util import write_json, run
 
 ip = subprocess.check_output(["hostname", "-I"], text=True).split()[0]
-cfg = validate({"server_ip": ip, "clients": [{"serial": "12345678", "ip": "192.0.2.2", "hostname": "test", "model": "pi4"}]})
+cfg = validate({"server_ip": ip, "clients": [{"serial": "12345678", "ip": "192.0.2.2", "hostname": "test", "model": "pi4", "container_storage_gib": 1, "containers": [{"name": "test", "image": "docker.io/library/busybox:latest"}]}]})
 store = Store(Path("/data/network-test"))
 store.register(cfg)
 store.state["clients"]["12345678"]["client"]["ip"] = ip
 generation = "a" * 24
 root = store.root("12345678", generation)
 root.mkdir(parents=True, exist_ok=True)
-(root / "immutable").write_text("original")
+(root / "system-file").write_text("original")
 write_json(root.parent / "manifest.json", {"client": cfg["clients"][0]})
 services = Services(store, cfg)
 mounts = []
@@ -43,7 +45,7 @@ try:
     Path("/scripts/nfs").write_text(
         'nfs_top() { :; }\nmodprobe() { :; }\nwait_for_udev() { :; }\n'
         'nfs_mount_root_impl() { sh /workspace/pxe_fleet/assets/fleet-nfsmount '
-        f'-o vers=4.1,ro {ip}:/12345678/roots/{late} /mnt/late; }}\n')
+        f'-o vers=4.1,rw,hard {ip}:/12345678/roots/{late} /mnt/late; }}\n')
     retry = subprocess.Popen(["sh", "-c", ". /workspace/pxe_fleet/assets/fleet-nfs; mountroot"], stderr=subprocess.PIPE, text=True)
     time.sleep(2)
     assert retry.poll() is None, "Client did not keep waiting for NFS"
@@ -54,42 +56,57 @@ try:
     assert retry.returncode == 0, retry_log
     assert "retrying" in retry_log
     assert Path("/mnt/late/ready").read_text() == "late NFS export"
-    for name in ("lower", "upper", "merged", "data"):
+    for name in ("os", "data", "containers"):
         Path("/mnt/" + name).mkdir(exist_ok=True)
-    run(["mount", "-t", "nfs", "-o", "vers=4.1,ro", f"{ip}:/12345678/roots/{generation}", "/mnt/lower"])
-    mounts.append("/mnt/lower")
-    run(["mount", "-t", "tmpfs", "tmpfs", "/mnt/upper"])
-    mounts.append("/mnt/upper")
-    Path("/mnt/upper/rw").mkdir()
-    Path("/mnt/upper/work").mkdir()
-    run(["mount", "-t", "overlay", "overlay", "-o", "lowerdir=/mnt/lower,upperdir=/mnt/upper/rw,workdir=/mnt/upper/work", "/mnt/merged"])
-    mounts.append("/mnt/merged")
-    Path("/mnt/merged/immutable").write_text("RAM change")
-    assert (root / "immutable").read_text() == "original"
+    run(["mount", "-t", "nfs", "-o", "vers=4.1,rw,hard", f"{ip}:/12345678/roots/{generation}", "/mnt/os"])
+    mounts.append("/mnt/os")
+    with Path("/mnt/os/system-file").open("w") as stream:
+        stream.write("installed package update")
+        stream.flush()
+        os.fsync(stream.fileno())
+    assert (root / "system-file").read_text() == "installed package update"
+    run(["umount", "/mnt/os"])
+    mounts.remove("/mnt/os")
+    run(["mount", "-t", "nfs", "-o", "vers=4.1,rw,hard", f"{ip}:/12345678/roots/{generation}", "/mnt/os"])
+    mounts.append("/mnt/os")
+    assert Path("/mnt/os/system-file").read_text() == "installed package update"
     data = store.path / "appdata/12345678"
-    run(["mount", "-t", "nfs", "-o", "vers=4.1,rw", f"{ip}:/12345678/appdata", "/mnt/data"])
+    run(["mount", "-t", "nfs", "-o", "vers=4.1,rw,hard", f"{ip}:/12345678/appdata", "/mnt/data"])
     mounts.append("/mnt/data")
     Path("/mnt/data/persistent").write_text("saved")
     assert (data / "persistent").read_text() == "saved"
-    # Exercise the actual initramfs transition, including moving backing mounts
-    # below the overlay root. Only module loading is stubbed: OverlayFS is already
-    # loaded above, while this container has no host kernel module directory.
-    Path("/mnt/bootroot").mkdir(exist_ok=True)
-    run(["mount", "-t", "nfs", "-o", "vers=4.1,ro", f"{ip}:/12345678/roots/{generation}", "/mnt/bootroot"])
-    mounts.append("/mnt/bootroot")
-    Path("/scripts").mkdir(exist_ok=True)
-    Path("/scripts/functions").write_text('panic() { echo "$*" >&2; exit 1; }\n')
-    Path("/tmp/helpers").mkdir(exist_ok=True)
-    Path("/tmp/helpers/modprobe").write_text("#!/bin/sh\nexit 0\n")
-    Path("/tmp/helpers/modprobe").chmod(0o755)
-    import os
-    run(["sh", "/workspace/pxe_fleet/assets/fleet-overlay"], env={**os.environ, "rootmnt": "/mnt/bootroot", "PATH": "/tmp/helpers:" + os.environ["PATH"]})
-    Path("/mnt/bootroot/immutable").write_text("boot overlay")
-    assert (root / "immutable").read_text() == "original"
+    # This is the real proposed storage path: the loop backing file is opened
+    # through NFS, never through the server's local path.
+    image = Path("/mnt/data/.fleet/podman.ext4")
+    run(["mount", "-t", "ext4", "-o", "loop,noatime", image, "/mnt/containers"])
+    mounts.append("/mnt/containers")
+    probe = Path("/mnt/containers/probe")
+    probe.write_text("survives unmount")
+    os.setxattr(probe, "user.fleet-test", b"metadata")
+    # Build a minimal native image without any registry dependency.
+    with tarfile.open("/tmp/container.tar", "w") as archive:
+        archive.add("/bin/busybox", arcname="bin/busybox")
+    podman = ["podman", "--root", "/mnt/containers/storage", "--runroot", "/run/fleet-storage-test",
+              "--storage-driver", "overlay", "--cgroup-manager", "cgroupfs", "--events-backend", "file"]
+    run(podman + ["import", "/tmp/container.tar", "localhost/fleet-test:latest"])
+    run(podman + ["run", "--name", "fleet-persistence", "--network", "none", "--cgroups", "disabled",
+                  "--security-opt", "seccomp=unconfined", "localhost/fleet-test:latest", "/bin/busybox",
+                  "sh", "-c", "echo container-write > /marker"])
+    run(podman + ["commit", "fleet-persistence", "localhost/fleet-saved:latest"])
+    run(podman + ["rm", "fleet-persistence"])
+    run(["umount", "/mnt/containers"])
+    mounts.remove("/mnt/containers")
+    run(["mount", "-t", "ext4", "-o", "loop,noatime", image, "/mnt/containers"])
+    mounts.append("/mnt/containers")
+    assert probe.read_text() == "survives unmount"
+    assert os.getxattr(probe, "user.fleet-test") == b"metadata"
+    result = subprocess.check_output(podman + ["run", "--rm", "--network", "none", "--cgroups", "disabled",
+        "--security-opt", "seccomp=unconfined", "localhost/fleet-saved:latest", "/bin/busybox", "cat", "/marker"], text=True)
+    assert result.strip() == "container-write"
     (store.path / "tftp/probe").write_text("boot payload")
     result = subprocess.check_output(["curl", "--fail", "--silent", f"tftp://{ip}/probe"], text=True)
     assert result == "boot payload"
-    print("Late NFS retry, NFSv4 read-only root, RAM overlay, persistent data, and TFTP passed", flush=True)
+    print("NFS retry, persistent writable OS, ext4-over-NFS Podman images/layers, appdata and TFTP passed", flush=True)
 finally:
     if retry is not None and retry.poll() is None:
         retry.kill()

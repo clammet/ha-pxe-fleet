@@ -14,7 +14,7 @@ FIELDS = ("fleet_format", "fleet_model", "fleet_serial", "fleet_generation",
 
 
 def sd_payload(boot, client, generation):
-    """Prepare and validate everything before the immutable generation is exported."""
+    """Prepare and validate everything before the matching generation and immutable boot payload are exported."""
     model = client["model"]
     if model == "pi5":
         return  # No supported U-Boot SD loader for this board yet.

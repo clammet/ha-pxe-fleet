@@ -57,6 +57,19 @@ def require_appdata():
         raise RuntimeError("Refusing to start applications without the persistent NFS mount")
 
 
+def require_container_storage(spec):
+    if not spec["containers"]:
+        return
+    result = json.loads(output(["findmnt", "--json", "--mountpoint", "/var/lib/containers", "-o", "FSTYPE,SOURCE"]))
+    mounts = result.get("filesystems", [])
+    if len(mounts) != 1 or mounts[0]["fstype"] != "ext4" or not mounts[0]["source"].startswith("/dev/loop"):
+        raise RuntimeError("Podman requires its NFS-backed ext4 disk; refusing RAM/direct-NFS storage")
+    backing = output(["losetup", "--noheadings", "--output", "BACK-FILE", mounts[0]["source"]])
+    expected = DATA / ".fleet/podman.ext4"
+    if expected.is_symlink() or not expected.samefile(backing):
+        raise RuntimeError("Podman disk is not this client's NFS backing file")
+
+
 def data_directory(relative, uid=0, gid=0, seed=None):
     path = DATA / relative
     # App data is writable by applications, so it may contain hostile symlinks.
@@ -159,6 +172,7 @@ def stage(spec):
 
 def prepare(spec):
     require_appdata()
+    require_container_storage(spec)
     prepare_accounts(spec)
     state = data_directory(".fleet")
     state.chmod(0o700)

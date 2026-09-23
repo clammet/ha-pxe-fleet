@@ -7,31 +7,43 @@ and loader update through A/B slots only when their contents change. The add-on 
 versioned Raspberry Pi OS Lite roots over NFSv4 and boot files over TFTP, and runs
 applications from signed APT repositories, OCI images using Podman, or both.
 
-The operating system is disposable. Application data is a separate NFS mount.
-The add-on preinstalls APT applications in each new OS generation. Subsequent APT
-updates, routine OS writes, logs and Podman image storage happen in RAM on the Pi.
-The add-on builds replacement operating systems on its local disk;
-it never runs APT against a root being used by a client.
+The operating system is disposable and stored on a **writable NFS root** unique
+to each Pi and OS generation. Application data is a separate NFS mount. There is
+no RAM-backed OS overlay. System files, APT databases and client package updates
+persist on the server across ordinary reboots.
+
+The add-on installs OS updates and initial APT applications on its own local disk,
+using QEMU when necessary. It publishes a new root and reboots the Pi after the
+build succeeds; it never runs host-side APT against a root being used by a client.
+Podman uses an ext4 disk-image file stored on the Pi's NFS appdata share, mounted
+at `/var/lib/containers`. Images and writable layers survive reboots and OS
+replacement. No local client disk or additional network protocol is required.
+Only normal runtime files, bounded logs, and reclaimable disk caches use RAM.
 
 ```mermaid
 flowchart LR
-    Upstream[Current Raspberry Pi OS Lite + APT updates] --> Build[Private build on add-on disk]
-    Build --> Generation[Immutable OS generation + matching kernel/initramfs]
-    Generation --> Boot[TFTP boot target]
-    Generation --> Root[Read-only NFS root]
-    Boot --> Pi[Pi: RAM overlay + Podman]
+    Upstream[Upstream image checksum] --> Cache[Prepared OS cache on add-on disk]
+    Apt[OS APT repositories] --> Cache
+    Cache --> Build[Private host-side build with QEMU as needed]
+    Build --> Boot[Matching immutable TFTP payload]
+    Build --> Root[Per-client writable NFS root]
+    Boot --> Pi[Pi running from NFS]
     Root --> Pi
-    Repo[Signed application APT source / container registry] --> Pi
-    Pi --> Data[Separate persistent appdata NFS mount]
-    Pi --> Health[Health confirmation or rollback]
+    Pi --> Data[Separate appdata NFS mount]
+    Data --> Disk[ext4 file on NFS for Podman]
 ```
 
-Every day by default, the add-on discovers the current official Lite image for
-each configured architecture, verifies its SHA256, runs an offline OS update and builds matching boot files.
-A changed image, package set or configuration creates a fresh generation.
-This includes future major Debian-based Raspberry Pi OS releases: the new image
-is rebuilt from scratch. Clients automatically reboot into the new generation.
-APT applications and mutable container tags update hourly by default.
+Every day by default, the add-on checks the official Lite image checksum and APT
+repositories for each configured architecture. A fresh image download/extraction
+and base build happens only on first use or a changed upstream SHA256. The verified
+hash and updated base are retained. With an unchanged hash, APT checks the prepared
+base; only package or builder changes cause a private update and boot-file rebuild.
+An unchanged result creates no generation and requests no reboot.
+
+This uses checksum gating rather than guessing major versions from image filenames.
+A same-release image refresh with a new hash can therefore trigger a clean build;
+new major Raspberry Pi OS releases also do. APT applications and mutable container
+tags update hourly on clients, writing to disk-backed NFS storage.
 
 **Experimental:** the automated checks exercise Linux image construction and
 network filesystems. Physical Pi boot and Home Assistant OS integration still

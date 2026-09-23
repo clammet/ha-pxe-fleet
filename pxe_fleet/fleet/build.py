@@ -12,6 +12,14 @@ from .util import atomic_write, capture, digest, run, write_json
 
 ASSETS = Path(__file__).resolve().parent.parent / "assets"
 LOG = logging.getLogger(__name__)
+PACKAGES = ("initramfs-tools", "busybox", "nfs-common", "python3", "ca-certificates", "gnupg", "podman", "openssh-server", "util-linux", "e2fsprogs")
+
+
+def remove_private_tree(path):
+    mounts = [line.split()[4] for line in Path("/proc/self/mountinfo").read_text().splitlines()]
+    if any(p == str(path) or p.startswith(str(path) + "/") for p in mounts):
+        raise RuntimeError(f"Refusing to remove a private build/cache with live mounts: {path}")
+    shutil.rmtree(path)
 
 
 def put(root, name, value, mode=0o644):
@@ -82,26 +90,44 @@ def install_initramfs(root):
     put(root, "etc/initramfs-tools/conf.d/fleet", "BOOT=fleet\nMODULES=most\nBUSYBOX=y\nCOMPRESS=gzip\n")
     put(root, "etc/initramfs-tools/conf.d/resume", "RESUME=none\n")
     for source, target in (
-        ("fleet-overlay", "etc/initramfs-tools/scripts/init-bottom/fleet-overlay"),
         ("fleet-nfs", "etc/initramfs-tools/scripts/fleet"),
         ("fleet-hook", "etc/initramfs-tools/hooks/fleet"),
         ("fleet-nfsmount", "usr/local/lib/fleet-nfsmount"),
     ):
         put(root, target, (ASSETS / source).read_bytes(), 0o755)
+    (root / "etc/initramfs-tools/scripts/init-bottom/fleet-overlay").unlink(missing_ok=True)
 
 
 def build_base(release, root, cache, scratch, arch="arm64"):
     ensure_emulation(arch)
     images.extract(images.image_file(release, cache), root, scratch)
+    return update_base(release, root, arch)
+
+
+def needs_upgrade(root, arch):
+    """Refresh only APT metadata on an unexported cache, then resolve the plan."""
+    ensure_emulation(arch)
+    put(root, "etc/resolv.conf", Path("/etc/resolv.conf").read_bytes())
+    with chroot_mounts(root):
+        chroot(root, "apt-get", "update", "--error-on=any")
+        plans = [chroot(root, "apt-get", "--simulate", "dist-upgrade", output=True),
+                 chroot(root, "apt-get", "--simulate", "--no-install-recommends", "install", *PACKAGES, output=True)]
+    return any(line.startswith(("Inst ", "Remv ", "Conf ")) for plan in plans for line in plan.splitlines())
+
+
+def update_base(release, root, arch="arm64", refresh=True):
+    """Apply packages locally to a private copy, never to a client's NFS root."""
+    ensure_emulation(arch)
     put(root, "usr/sbin/policy-rc.d", "#!/bin/sh\nexit 101\n", 0o755)
     put(root, "etc/resolv.conf", Path("/etc/resolv.conf").read_bytes())
     put(root, "etc/fstab", "# Mounts are managed by PXE Fleet.\n")
     put(root, "etc/initramfs-tools/conf.d/fleet", "BOOT=nfs\nMODULES=most\nBUSYBOX=y\nCOMPRESS=gzip\n")
     put(root, "etc/initramfs-tools/conf.d/resume", "RESUME=none\n")
     with chroot_mounts(root):
-        chroot(root, "apt-get", "update", "--error-on=any")
+        if refresh:
+            chroot(root, "apt-get", "update", "--error-on=any")
         chroot(root, "apt-get", "-y", "-o", "Dpkg::Options::=--force-confold", "dist-upgrade")
-        chroot(root, "apt-get", "-y", "--no-install-recommends", "install", "initramfs-tools", "busybox", "nfs-common", "python3", "ca-certificates", "gnupg", "podman", "openssh-server")
+        chroot(root, "apt-get", "-y", "--no-install-recommends", "install", *PACKAGES)
         install_initramfs(root)
         if chroot(root, "dpkg", "--print-architecture", output=True) != arch:
             raise RuntimeError(f"Expected an {arch} root image")
@@ -140,7 +166,7 @@ def build_base(release, root, cache, scratch, arch="arm64"):
     put(root, "etc/systemd/system.conf.d/fleet.conf", "[Manager]\nRuntimeWatchdogSec=30s\nRebootWatchdogSec=5min\n")
     # networkd renews the reserved lease while retaining the initramfs address.
     put(root, "etc/containers/storage.conf", '[storage]\ndriver="overlay"\nrunroot="/run/containers/storage"\ngraphroot="/var/lib/containers/storage"\n')
-    return digest({"release": release, "packages": sorted(versions.splitlines()), "builder": source_revision()})
+    return digest({"image_sha256": release["sha256"], "packages": sorted(versions.splitlines()), "builder": source_revision()})
 
 
 def prepare_client(root, spec, generation, token, data_export):
@@ -153,9 +179,13 @@ def prepare_client(root, spec, generation, token, data_export):
     put(root, "etc/hostname", spec["hostname"] + "\n")
     put(root, "etc/hosts", f"127.0.0.1 localhost\n127.0.1.1 {spec['hostname']}\n::1 localhost\n")
     put(root, "etc/resolv.conf", "".join(f"nameserver {ip}\n" for ip in spec["dns"]))
-    put(root, "etc/fstab", f"{spec['server_ip']}:{data_export} /appdata nfs4 rw,hard,vers=4.1,proto=tcp,_netdev,noatime 0 0\n"
-        f"tmpfs /var/lib/containers tmpfs defaults,size={spec['podman_size']},mode=0700 0 0\n")
-    for path in ("appdata", "var/lib/containers", ".fleet"):
+    mounts = f"{spec['server_ip']}:{data_export} /appdata nfs4 rw,hard,vers=4.1,proto=tcp,_netdev,noatime 0 0\n"
+    if spec["containers"]:
+        # ext4 supplies OverlayFS/xattr semantics; every backing byte lives on
+        # the NFS server. systemd orders shutdown before unmounting appdata.
+        mounts += "/appdata/.fleet/podman.ext4 /var/lib/containers ext4 loop,_netdev,noatime,x-systemd.requires-mounts-for=/appdata 0 0\n"
+    put(root, "etc/fstab", mounts)
+    for path in ("appdata", "var/lib/containers"):
         (root / path).mkdir(parents=True, exist_ok=True)
     for asset in ("fleet-agent.service", "fleet-prepare.service"):
         put(root, "etc/systemd/system/" + asset, (ASSETS / asset).read_bytes())
@@ -198,7 +228,8 @@ class Builder:
 
     def clean_stale(self):
         mounts = [line.split()[4] for line in Path("/proc/self/mountinfo").read_text().splitlines()]
-        candidates = [*(self.storage / "build").glob("base-*"), *(self.storage / "generations").glob("*/.stage-*")]
+        candidates = [*(self.storage / "build").glob("base-*"), *(self.storage / "generations").glob("*/.stage-*"),
+                      *(self.storage / "bases").glob("*/*/.stage-*")]
         for path in candidates:
             if any(p == str(path) or p.startswith(str(path) + "/") for p in mounts):
                 raise RuntimeError(f"Stale build still has mounts; refusing cleanup: {path}")
@@ -209,17 +240,49 @@ class Builder:
     def base(self, release, arch="arm64"):
         cache = self.storage / "cache" / arch
         cache.mkdir(parents=True, exist_ok=True)
-        for file in cache.iterdir():
-            if file.is_file() and file.stem != release["sha256"]:
-                file.unlink()
-        scratch = self.storage / "build"
-        scratch.mkdir(parents=True, exist_ok=True)
-        work = Path(tempfile.mkdtemp(prefix="base-", dir=scratch))
+        # Persist the verified upstream hash separately from the package revision.
+        # Equal hashes never enter image_file/extract/build_base again.
+        directory = self.storage / "bases" / arch / release["sha256"]
+        directory.mkdir(parents=True, exist_ok=True)
+        pointer = directory / "current.json"
+        current = json.loads(pointer.read_text()) if pointer.exists() else None
+        previous = directory / current["fingerprint"] if current else None
+        if previous and not (previous / "root").is_dir():
+            raise RuntimeError("Prepared base cache is missing its root; repair the cache before updating")
+        revision = source_revision()
+        if previous:
+            changed = needs_upgrade(previous / "root", arch)
+            if not changed and current["builder"] == revision:
+                LOG.info("Reusing prepared %s base: upstream image and installed packages unchanged", arch)
+                yield previous / "root", current["fingerprint"]
+                return
+        work = Path(tempfile.mkdtemp(prefix=".stage-", dir=directory))
         try:
             root = work / "root"
-            LOG.info("Building OS from %s", release["url"])
-            fingerprint = build_base(release, root, cache, work, arch)
-            yield root, fingerprint
+            if previous:
+                LOG.info("Updating cached %s OS locally; upstream image unchanged", arch)
+                run(["cp", "-a", "--reflink=auto", previous / "root", root])
+                fingerprint = update_base(release, root, arch, refresh=False)
+            else:
+                LOG.info("New upstream image checksum: building %s from %s", arch, release["url"])
+                fingerprint = build_base(release, root, cache, work, arch)
+            final = directory / fingerprint
+            if not final.exists():
+                run(["sync", "-f", work])
+                work.rename(final)
+            write_json(pointer, {"image_sha256": release["sha256"], "fingerprint": fingerprint, "builder": revision})
+            # No cached base is exported. Commit its pointer before retiring old
+            # versions, so interruption always leaves a complete selected root.
+            for old in directory.iterdir():
+                if old.is_dir() and old != final and not old.name.startswith("."):
+                    remove_private_tree(old)
+            for old in directory.parent.iterdir():
+                if old.is_dir() and old != directory:
+                    remove_private_tree(old)
+            for file in cache.iterdir():
+                if file.is_file() and file.stem != release["sha256"]:
+                    file.unlink()
+            yield final / "root", fingerprint
         finally:
             # Never recursively remove a chroot with live bind mounts, including
             # when an unmount failed. TemporaryDirectory's exit finalizer is unsafe
@@ -227,5 +290,5 @@ class Builder:
             mounts = [line.split()[4] for line in Path("/proc/self/mountinfo").read_text().splitlines()]
             if any(p == str(work) or p.startswith(str(work) + "/") for p in mounts):
                 LOG.error("Retaining build directory with live mounts: %s", work)
-            else:
+            elif work.exists():
                 shutil.rmtree(work)

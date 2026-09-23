@@ -55,21 +55,28 @@ not a secure-boot system. Root exports are restricted to each reserved address.
 | `app_update_minutes` | 60 | Client APT/Podman update interval |
 | `boot_timeout_seconds` | 900 | Time after contact/reboot request to confirm health |
 | `min_free_gib` | 8 | Stop staging before disk space becomes critical |
-| `overlay_size` | `50%` | Maximum RAM filesystem size for OS changes |
-| `podman_size` | `25%` | Maximum RAM filesystem size for container storage |
 | `control_port` | 8099 | Signed client report/reboot endpoint |
 | `ssh_authorized_keys` | `[]` | Root SSH public keys; SSH is disabled when empty |
 | `image` | `{}` | Optional fixed ARM64 HTTPS image URL and SHA256 |
 | `image_armhf` | `{}` | Optional fixed 32-bit Raspberry Pi OS image URL and SHA256 for Pi 1/2 |
 
-The two RAM limits are independent ceilings, not reservations. Processes still
-need memory. A Pi 3 with 1 GB RAM is suitable only for small packages and images;
-large installations can exhaust RAM. No swap is configured. Start with one Pi
-and measure the workload before deploying a fleet. Allow roughly 15 GB for build
-workspace/cache per OS architecture, plus several GB per retained client generation.
-Pi 1 needs ARMv6-compatible packages/images and very small workloads; ordinary
-Debian ARMv7-only `armhf` binaries are not compatible with it. All server data
-lives in the add-on's `/data/fleet` on local storage, never on a remote NFS mount.
+Each client has a writable NFS OS root and a separate writable appdata export.
+OS files and package databases persist across ordinary reboots; replacing the OS
+generation replaces that root. There is no tmpfs root overlay. Linux uses normal
+reclaimable file caches and writes dirty data back to the NFS server; the server
+exports use `sync` and clients use `hard` mounts. This is not a special RAM cache
+or a promise that every write syscall is synchronously durable: applications must
+still use their normal fsync/transaction semantics.
+
+Small runtime files and the bounded volatile journal remain in RAM. No swap is
+configured. Pi 1 still needs ARMv6-compatible applications and sufficient process
+memory. Allow space for a prepared base, a private update copy, downloaded images,
+and retained per-client roots (roughly 20 GB of build/cache headroom per architecture,
+plus client storage). All backing files live under the add-on's `/data/fleet`.
+
+The old `overlay_size` and `podman_size` settings have been removed; remove them
+from `fleet.yaml`. Existing deployments pick up the new mount layout when they
+boot a newly built generation; SD format-v2 cards do not need reflashing for this.
 
 ## APT applications
 
@@ -93,21 +100,27 @@ Each client has an `apt` mapping:
 [`examples/apt-source.yaml`](../examples/apt-source.yaml) shows a custom source.
 An application package should supply its own configuration and service unit.
 Configure that application to write durable state into its persistent directory.
-Package-manager databases, all of `/var`, and Podman graph storage must not be
-made persistent. Application logs should go to the journal or a RAM directory
-unless persistence is needed. Configuration under `/etc` is disposable; package
-it or have the application read it from its persistent directory.
+Keep package-manager databases in the disposable OS root; do not redirect them
+into appdata. They are now disk-backed on NFS and survive reboots of that root.
+Application logs should use the bounded journal unless durable logging is needed.
+Configuration under `/etc` survives reboots but is replaced with a new generation;
+package it or have the application read it from its persistent directory.
 
-The add-on installs configured APT applications while building the private OS
-generation. Package-provided initial data is copied into a persistent directory
-only when that directory is first created. Existing appdata is never reseeded.
-The Pi can start those staged application versions without downloading packages
-again. On each boot and then at the configured interval it pulls and installs
-updates with APT in its RAM overlay, avoiding the many small NFS writes from
-dpkg. Reboot discards those RAM updates, so APT reapplies any changes newer than
-the staged package versions. OS updates happen separately in a fresh server
-build, including security updates to the base system. Client kernel updates are
-pinned out so running kernels and served boot files cannot drift apart.
+The add-on installs configured APT applications on local host storage while
+building a private OS generation, using QEMU for cross-architecture scripts.
+Package-provided initial data is seeded into appdata only on first creation.
+Existing appdata is never reseeded. The Pi starts these preinstalled versions
+without downloading them again. At the configured interval it pulls application
+updates with APT and installs them into its writable NFS root. Those updates
+survive reboot; they are not held in RAM or merged into the host's cached base.
+This client-side update path trades NFS write speed for low RAM use.
+
+OS/security updates run on the host against a private copy of its prepared base,
+then produce a replacement client generation. Client kernel updates are pinned
+out to keep the running kernel, modules and served boot payload consistent.
+A replacement generation freshly installs the application's current repository
+version. The host never edits an exported root or tries to copy a live dpkg
+transaction from a client.
 
 If a third-party repository has not published packages for a new major OS,
 staging fails and the running OS remains in place. Automatic OS tracking does not make
@@ -123,12 +136,32 @@ are `environment` (string values), `command` (argument list), `ports`, `devices`
 `read_only` boolean. Use a mutable tag for automatic image updates; a digest
 deliberately pins the image.
 
-The add-on generates rootful Podman Quadlets. Podman image layers and container
-writable layers use a separate tmpfs, so each reboot pulls images again.
-Persistent appdata is bind-mounted into containers. Do not put Podman's graphroot
-on NFS: its overlay storage needs local filesystem semantics. Container logs use
-the volatile system journal. Podman's `auto-update` restarts updated containers
-and requests its built-in rollback when a service restart fails.
+The add-on generates rootful Podman Quadlets. Each client with containers gets
+one sparse ext4 disk-image file at `/appdata/.fleet/podman.ext4`, created and
+formatted once on the add-on host. The Pi mounts that file through NFS with a
+loop device at `/var/lib/containers`. Podman's OverlayFS storage therefore sees
+ext4, including the extended attributes it requires; all backing bytes still
+travel over NFS. There is no client USB/SSD, RAM image store, or NBD/iSCSI service.
+
+Set `container_storage_gib` on the client to choose the initial virtual capacity
+(default 8 GiB). This setting applies when creating the file; existing disks are
+never reformatted or resized automatically. Sparse allocation grows as used, so
+monitor actual server space and free space inside the container filesystem.
+Images and writable layers persist across both reboots and OS replacement.
+The client refuses to start applications if the expected ext4 mount is absent
+or backed by a different file. Only one Pi may mount its assigned image.
+
+Do not mount or modify a client's ext4 image from the host while it is in use.
+Back up the image only with that client's containers/filesystem quiesced; this is
+a real filesystem, so interruption or exhausted server storage can require an
+offline filesystem check. Boot uses ext4's normal journal recovery; never repair
+a mounted image. These requirements also apply after a network/server outage.
+Application volumes remain separate directories on appdata; use them for important
+data rather than relying on a container's writable layer. Logs use the bounded
+volatile journal. Podman auto-update restarts changed containers and requests its
+built-in rollback if restart fails.
+The container disk is not rolled back with the OS; a Podman storage database
+upgrade can prevent an older Podman version from using it after an OS rollback.
 
 For a private registry, log in on the Pi with:
 
@@ -140,22 +173,26 @@ The auth file persists across OS resets; Quadlets and auto-update both use it.
 
 ## Update and recovery behavior
 
-1. Discover the current official Lite release for each configured architecture
-   through Raspberry Pi's latest URL and verify its matching SHA256. Pinning
-   `image: {url, sha256}` (ARM64) or `image_armhf: {url, sha256}` disables discovery
-   for that architecture while keeping APT OS updates enabled.
-2. Extract a clean image into private local storage. Run OS APT upgrades offline,
-   install client prerequisites, and build initramfs images for both Pi kernel
-   families (v6/v7 for Pi 1/2, v8/2712 for Pi 3/4/5). Cross-architecture
-   maintainer scripts run through QEMU binfmt. Each architecture has its own cache
-   and build; a failed 32-bit build does not prevent a 64-bit update.
-3. Fingerprint the upstream image, base package versions, builder and client
-   configuration. An unchanged result causes no reboot or generation creation.
+1. Resolve the official Lite image URL and checksum for each architecture.
+   Persist that SHA256 with the prepared base. Download/extract/build from the
+   upstream image only on first use or a changed checksum. This deliberately uses
+   hash gating, not unreliable major-version inference from filenames. A new
+   image within the same Debian release can still trigger a fresh build. Pinning
+   `image` or `image_armhf` fixes the upstream image but still permits APT updates.
+2. For an unchanged hash, reuse the already-updated, unexported base. Refresh APT
+   metadata and simulate the upgrade/prerequisite installation. With no package
+   or builder changes, skip copying the base, installing packages and rebuilding
+   initramfs. New packages are applied locally to a private copy, with QEMU as
+   needed. A failed update leaves the previously committed base selected.
+3. Fingerprint the image hash, installed base packages, builder and client
+   configuration. An unchanged result creates no generation or reboot. The
+   cache is never a client's root and is never exported. Updating one architecture
+   does not change the cache or existing roots for another architecture.
 4. Copy the prepared OS into a new per-client generation and install its APT
-   sources, service accounts and application packages offline. Export it read-only and
+   sources, service accounts and application packages offline. Export it read-write to that Pi and
    publish a complete immutable TFTP payload. An atomic `config.txt` selects the
    payload using `os_prefix`, including its matching kernel, modules and initramfs.
-   SD loaders read an atomic `boot.env` pointing to the same immutable generation,
+   SD loaders read an atomic `boot.env` pointing to the matching immutable boot payload,
    with a U-Boot-compatible kernel plus file sizes and SHA256 hashes. Changed SD
    firmware/device trees/U-Boot are staged in the inactive card slot before reboot;
    an SD trial cannot confirm the OS until the boot slot is committed. NFS root
@@ -211,11 +248,13 @@ python3 -m fleet.ctl rollback 1234abcd
 builds for one client. `rollback` requests the previous confirmed generation and
 quarantines the current one; it requires no pending rollout. Requests are queued
 and their result appears in the log. The status command omits client secrets.
-Rebooting a Pi resets its RAM OS changes and starts its staged applications;
-its appdata and SSH host identity remain intact.
+Rebooting a Pi retains its NFS OS changes, installed application updates and
+Podman images. An OS replacement or rollback selects a different root; appdata,
+the container disk and SSH host identity remain intact.
 
 Restart the add-on to load edited configuration. Do not rename/delete exported
-root directories, modify a live root, or move storage behind an NFS client.
+root directories, run host-side APT against a live root, or move storage behind
+an NFS client. Normal client-side writes to that client's own root are expected.
 
 ## Design references
 

@@ -34,6 +34,14 @@ try:
         assert "fleet-web.service" in generated
         assert "--authfile=/appdata/.fleet/registry-auth.json" in generated
         chroot(root, "systemd-analyze", "verify", "--man=no", "fleet-agent.service", "fleet-prepare.service")
+        for name in ("fstab-normal", "fstab-early", "fstab-late"):
+            (root / "tmp" / name).mkdir(exist_ok=True)
+        chroot(root, "/usr/lib/systemd/system-generators/systemd-fstab-generator",
+               "/tmp/fstab-normal", "/tmp/fstab-early", "/tmp/fstab-late")
+        mount = (root / "tmp/fstab-normal/var-lib-containers.mount").read_text()
+        assert "What=/appdata/.fleet/podman.ext4" in mount
+        assert "RequiresMountsFor=/appdata" in mount
+        assert "Type=ext4" in mount and "loop" in mount
         # Exercise the same client-side update code again: installed packages
         # should already be current, and the stable service UID must survive.
         chroot(root, "python3", "-c", "import json,runpy; m=runpy.run_path('/usr/local/lib/pxe-fleet-client.py'); s=json.load(open('/etc/pxe-fleet.json')); m['configure_sources'](s); m['apt_install'](s, initial=True)")

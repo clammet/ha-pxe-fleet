@@ -3,7 +3,7 @@
 The card contains Raspberry Pi firmware, U-Boot and a small retry script. It
 contains **no deployed OS, application or app data**. On each boot it fetches a
 complete kernel/initramfs generation from the add-on, verifies file sizes and
-SHA256 hashes, and starts the usual NFS root with its RAM overlay and separate
+SHA256 hashes, and starts the writable NFS root and separate
 persistent `/appdata` mount.
 
 If HA is still starting, DHCP fails, or a download is interrupted, the loader
@@ -37,7 +37,7 @@ Wi-Fi, Pi A variants, Compute Modules and external USB Ethernet adapters are not
 covered by this initial implementation.
 
 Pi 1 has very little RAM. Prefer small APT services; a 256 MB board can be
-particularly constrained during initramfs unpacking and APT updates. Applications
+particularly constrained during initramfs unpacking and application execution. Applications
 and OCI images must support the actual CPU: Pi 1 needs ARMv6, not an ARMv7-only
 `armhf` binary. Podman cannot make an incompatible image run. No swap writes to
 SD are enabled. All boards still require physical boot validation; successful

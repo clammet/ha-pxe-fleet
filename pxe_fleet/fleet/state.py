@@ -1,4 +1,4 @@
-"""Durable rollout state, immutable generations, and atomic boot publication."""
+"""Durable rollout state, per-client NFS roots, and atomic boot publication."""
 import json
 import logging
 from pathlib import Path
@@ -10,6 +10,7 @@ import time
 from .build import prepare_client, stage_applications
 from .boot import sd_payload
 from .sdmedia import prepare_updates
+from .storage import container_disk
 from .config import architecture, client_spec, kernel_flavor
 from .util import atomic_write, digest, run, write_json
 
@@ -47,6 +48,11 @@ class Store:
                 entry["client"] = client
                 (self.path / "appdata" / serial).mkdir(parents=True, exist_ok=True)
             self.save()
+            # Persist identity before publishing any disk derived from it. A
+            # crash between formatting and save must not orphan a valid disk.
+            for client in cfg["clients"]:
+                serial = client["serial"]
+                container_disk(self.path / "appdata" / serial, client, self.state["clients"][serial]["token"])
 
     def root(self, serial, generation):
         return self.path / "generations" / serial / generation / "root"
@@ -119,8 +125,8 @@ class Store:
             shutil.copy2(boot / ("fleet-kernel-" + flavor), boot / "fleet-kernel")
             shutil.copy2(boot / ("fleet-initrd-" + flavor), boot / "fleet-initrd")
             cmdline = (f"console=serial0,115200 console=tty1 root=/dev/nfs boot=fleet "
-                       f"nfsroot={cfg['server_ip']}:{self.nfs_root(serial, generation)},vers=4.1,proto=tcp,ro "
-                       f"ip=dhcp rw rootwait panic=30 fleet.overlay={cfg['overlay_size']}\n")
+                       f"nfsroot={cfg['server_ip']}:{self.nfs_root(serial, generation)},vers=4.1,proto=tcp,rw,hard "
+                       f"ip=dhcp rw rootwait panic=30\n")
             atomic_write(boot / "cmdline.txt", cmdline)
             sd_payload(boot, client, generation)
             prepare_updates(root, spec)
@@ -251,7 +257,7 @@ class Store:
                     continue
                 generation = manifest.parent.name
                 fsid = int(digest([serial, generation])[:15], 16) + 1
-                lines.append(f"{pseudo / serial / 'roots' / generation} {ip}(ro,fsid={fsid},sync,no_subtree_check,no_root_squash,insecure)")
+                lines.append(f"{pseudo / serial / 'roots' / generation} {ip}(rw,fsid={fsid},sync,no_subtree_check,no_root_squash,insecure)")
             fsid = int(digest([serial, 'appdata'])[:15], 16) + 1
             lines.append(f"{pseudo / serial / 'appdata'} {ip}(rw,fsid={fsid},sync,no_subtree_check,no_root_squash,insecure)")
         return "\n".join(lines) + "\n"

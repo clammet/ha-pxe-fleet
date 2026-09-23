@@ -1,3 +1,11 @@
+## 0.4.0
+
+- Reuse prepared bases by upstream image SHA256; unchanged APT plans skip rebuilds.
+- Apply OS updates locally to private cached-base copies, using QEMU when needed.
+- Writable per-client NFS OS roots replace the RAM overlay; APT changes survive reboot.
+- Podman images/layers persist in a per-client ext4 file stored and accessed over NFS.
+- Remove overlay_size/podman_size; add per-client container_storage_gib for initial disk capacity.
+
 ## 0.3.0
 
 - SD format v2: immutable recovery files plus two firmware slots and one-shot trial boots.

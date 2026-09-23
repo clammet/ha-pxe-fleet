@@ -5,7 +5,7 @@ case "${1:-}" in prereqs) exit 0;; esac
 . /usr/share/initramfs-tools/hook-functions
 # Drivers differ between v8 and 2712 kernels and some are built in. A missing
 # optional module must not fail the whole hook.
-for module in overlay nfs nfsv4 bcmgenet macb lan78xx smsc95xx usbnet dwc2 dwc_otg xhci_pci xhci_plat_hcd; do
+for module in nfs nfsv4 bcmgenet macb lan78xx smsc95xx usbnet dwc2 dwc_otg xhci_pci xhci_plat_hcd; do
     manual_add_modules "$module" || true
 done
 copy_exec /sbin/mount.nfs /sbin/mount.nfs

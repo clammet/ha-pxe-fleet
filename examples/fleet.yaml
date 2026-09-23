@@ -6,8 +6,6 @@ os_check_hours: 24
 app_update_minutes: 60
 boot_timeout_seconds: 900
 min_free_gib: 8
-overlay_size: 50%
-podman_size: 25%
 ssh_authorized_keys: []
 
 clients:
@@ -20,6 +18,8 @@ clients:
     # Format-v2 SD cards automatically update firmware/U-Boot through A/B slots.
     # Native clients never write an inserted SD card.
     sd_updates: true
+    # Sparse ext4 disk on NFS for Podman; created once, retained across OS upgrades.
+    container_storage_gib: 8
     # For the first SD boot, also pass peripheral options when making the card.
     boot_options:
       - dtparam=i2c_arm=on

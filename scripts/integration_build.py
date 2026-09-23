@@ -7,6 +7,7 @@ import argparse
 import logging
 from pathlib import Path
 import sys
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "pxe_fleet"))
 
@@ -33,13 +34,14 @@ if set(store.state["clients"]) - {"12345678"}:
 store.register(cfg)
 store.state["clients"]["12345678"]["pending"] = None
 store.save()
-with Builder(store.path).base(discover(arch=args.arch), args.arch) as (base, fingerprint):
+release = discover(arch=args.arch)
+builder = Builder(store.path)
+with builder.base(release, args.arch) as (base, fingerprint):
     for flavor in (("v8", "2712") if args.arch == "arm64" else ("v6", "v7")):
         listing = chroot(base, "lsinitramfs", "/boot/firmware/fleet-initrd-" + flavor, output=True)
-        assert "scripts/init-bottom/fleet-overlay" in listing
+        assert "scripts/init-bottom/fleet-overlay" not in listing
         assert "scripts/fleet" in listing and "scripts/nfs" in listing
         assert "mount.nfs" in listing
-        assert "overlay.ko" in listing
         chroot(base, "unmkinitramfs", "/boot/firmware/fleet-initrd-" + flavor, "/tmp/fleet-initrd-check")
         helpers = list((base / "tmp/fleet-initrd-check").rglob("nfsmount"))
         assert any(p.is_file() and b"exec /sbin/mount.nfs" in p.read_bytes() for p in helpers)
@@ -55,3 +57,10 @@ with Builder(store.path).base(discover(arch=args.arch), args.arch) as (base, fin
     assert updates[model]["raw_size"] == 64 * 1024**2
     assert (index.parent / (model + ".img.gz")).is_file()
     print("Successfully built and staged real generation", generation, flush=True)
+# The second real APT check must reuse the prepared root and initramfs. Any
+# accidental fresh extraction or build is a failure, not a silently slow pass.
+with patch("fleet.build.build_base", side_effect=AssertionError("Unchanged image was rebuilt")), \
+     patch("fleet.build.update_base", side_effect=AssertionError("Unchanged packages were rebuilt")):
+    with builder.base(release, args.arch) as (again, again_fingerprint):
+        assert again == base and again_fingerprint == fingerprint
+print("Unchanged upstream hash and APT state reused the prepared base", flush=True)

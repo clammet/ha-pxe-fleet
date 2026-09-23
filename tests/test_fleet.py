@@ -111,6 +111,18 @@ class RolloutTests(unittest.TestCase):
     def report(self, generation, healthy=False, updating=False):
         return {"generation": generation, "healthy": healthy, "nonce": "test", "updating": updating}
 
+    def test_disk_creation_failure_does_not_lose_new_client_identity(self):
+        cfg = copy.deepcopy(self.cfg)
+        cfg["clients"][0]["serial"] = "deadbeef"
+        with patch("fleet.state.container_disk", side_effect=RuntimeError("format interrupted")):
+            with self.assertRaises(RuntimeError):
+                self.store.register(cfg)
+        token = self.store.state["clients"]["deadbeef"]["token"]
+        restarted = Store(self.store.path)
+        with patch("fleet.state.container_disk") as provision:
+            restarted.register(cfg)
+        self.assertEqual(provision.call_args.args[2], token)
+
     def test_publish_waits_for_confirmation_and_survives_restart(self):
         self.store.activate(self.serial, self.new)
         self.assertEqual(self.store.state["clients"][self.serial]["active"], self.old)
@@ -199,10 +211,10 @@ class RolloutTests(unittest.TestCase):
         self.assertEqual(self.store.prune_candidates(now=1000000), [])
         self.assertEqual(self.store.prune_candidates(now=1000000 + 7 * 86400), [(self.serial, self.new)])
 
-    def test_exports_are_per_client_and_only_appdata_is_writable(self):
+    def test_exports_are_per_client_with_separate_writable_root_and_appdata(self):
         exports = self.store.exports()
         self.assertNotIn("*", exports)
-        self.assertEqual(sum("(rw," in line for line in exports.splitlines()), 1)
+        self.assertEqual(sum("(rw," in line for line in exports.splitlines()), 3)
         self.assertIn(str(self.store.path / "nfs" / self.serial / "appdata"), exports)
         self.assertNotIn(self.new, self.store.exports([(self.serial, self.new)]))
 

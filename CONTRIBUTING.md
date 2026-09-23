@@ -6,14 +6,14 @@ Use Python 3.11 or newer. Run the portable tests and configuration validation:
 python3 -m pip install PyYAML
 PYTHONPATH=pxe_fleet python3 -m unittest discover -s tests -v
 PYTHONPATH=pxe_fleet python3 -m fleet.server --config examples/fleet.yaml --validate
-shellcheck pxe_fleet/assets/fleet-hook pxe_fleet/assets/fleet-overlay pxe_fleet/assets/fleet-nfsmount pxe_fleet/assets/fleet-nfs boot-media/*.sh boot-media/scripts/*.sh pxe_fleet/bootloader/build-tools.sh
+shellcheck pxe_fleet/assets/fleet-hook pxe_fleet/assets/fleet-nfsmount pxe_fleet/assets/fleet-nfs boot-media/*.sh boot-media/scripts/*.sh pxe_fleet/bootloader/build-tools.sh
 docker build -t ha-pxe-fleet:test pxe_fleet
 ```
 
-Three integration checks use real Linux mounts. Run them in disposable containers,
+The integration checks use real Linux mounts. Run them in disposable containers,
 with isolated networking. Do not add host networking to these test commands.
 The image check downloads the official ARM64 Lite image and runs APT; allow
-approximately 15 GB of disk space and several minutes. On an x86-64 test host,
+approximately 20 GB of disk space per architecture and several minutes. On an x86-64 test host,
 it registers a QEMU binfmt interpreter so ARM64 package scripts can execute.
 
 ```sh
@@ -22,10 +22,17 @@ docker run --rm --privileged \
   --mount "type=bind,src=$(pwd),dst=/workspace,readonly" \
   ha-pxe-fleet:test python3 /workspace/scripts/integration_build.py
 
+# The network test additionally runs native Podman containers from a minimal
+# local image. These dependencies are for the disposable test image only.
+docker build -t ha-pxe-fleet:network-test -f - . <<'EOF'
+FROM ha-pxe-fleet:test
+RUN apt-get update && apt-get install -y --no-install-recommends podman busybox-static
+EOF
+
 docker run --rm --privileged \
   --mount type=volume,src=pxe-fleet-network-test,dst=/data \
   --mount "type=bind,src=$(pwd),dst=/workspace,readonly" \
-  ha-pxe-fleet:test python3 /workspace/scripts/integration_network.py
+  ha-pxe-fleet:network-test python3 /workspace/scripts/integration_network.py
 
 docker run --rm --privileged \
   --mount type=volume,src=pxe-fleet-validation,dst=/data \
@@ -34,9 +41,12 @@ docker run --rm --privileged \
 ```
 
 The network check requires the Linux host's NFS server and OverlayFS support.
-It verifies NFSv4 mounts, RAM-only changes to the OS, persistent data writes and
-actual TFTP transfers and the real initramfs mount transition. The image check verifies extraction, package updates,
-kernel/initramfs construction and generation staging. The units check uses the
+It verifies OS writes survive NFS remounts, separate appdata, late-server mount
+retries, TFTP, and actual Podman images/writable layers on an ext4 file opened
+through NFS. It unmounts/remounts the container filesystem and runs a saved image
+again. The image check verifies extraction, host-side package updates, boot-file
+construction and staging, then checks that a second unchanged APT/image check
+reuses the prepared base without extraction or boot-file regeneration. The units check uses the
 real Podman generator and installs an APT application in an unpublished root.
 These checks do not substitute
 for booting physical Pi 3, 4 and 5 boards under Home Assistant OS.
@@ -57,7 +67,8 @@ hardware compatibility from unit tests alone.
 
 Install `dosfstools`, `mtools` and `u-boot-tools` to include the real FAT image
 round-trip and SD update fault checks in the portable suite. Push/PR CI installs
-these tools; checks whose required tools are absent are explicitly skipped.
+these tools plus `e2fsprogs` for container disk identity/preservation checks;
+checks whose required tools are absent are explicitly skipped.
 
 Run `./boot-media/build.sh all` to cross-compile all five loaders. See
 [boot-media/README.md](boot-media/README.md) for preparing per-device images.

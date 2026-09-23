@@ -86,7 +86,7 @@ def target_path(value):
 
 def validate(raw):
     cfg = copy.deepcopy(raw)
-    keys(cfg, "server_ip control_port os_check_hours app_update_minutes boot_timeout_seconds min_free_gib overlay_size podman_size dns ssh_authorized_keys image image_armhf clients", "fleet")
+    keys(cfg, "server_ip control_port os_check_hours app_update_minutes boot_timeout_seconds min_free_gib dns ssh_authorized_keys image image_armhf clients", "fleet")
     cfg["server_ip"] = ipv4(cfg.get("server_ip"))
     for key, default, low, high in (
         ("control_port", 8099, 1024, 65535), ("os_check_hours", 24, 1, 720),
@@ -94,8 +94,6 @@ def validate(raw):
         ("min_free_gib", 8, 1, 1024),
     ):
         cfg[key] = integer(cfg.get(key, default), low, high, key)
-    for key, default in (("overlay_size", "50%"), ("podman_size", "25%")):
-        cfg[key] = string(cfg.get(key, default), r"(?:[1-9][0-9]?%|[1-9][0-9]*[MG])", key)
     cfg["dns"] = [ipv4(v) for v in array(cfg.get("dns", [cfg["server_ip"]]), "dns")]
     if not cfg["dns"]:
         fail("At least one DNS server is required")
@@ -112,7 +110,8 @@ def validate(raw):
         fail("Configure at least one client")
     serials, ips, hosts = set(), set(), set()
     for c in clients:
-        keys(c, "serial ip hostname model boot_options sd_updates apt containers", "client")
+        keys(c, "serial ip hostname model boot_options sd_updates container_storage_gib apt containers", "client")
+        c["container_storage_gib"] = integer(c.get("container_storage_gib", 8), 1, 1024, "container_storage_gib")
         if type(c.setdefault("sd_updates", True)) is not bool:
             fail("sd_updates must be a boolean")
         serial = string(c.get("serial"), r"(?:0x)?[a-fA-F0-9]{8,16}", "serial").lower().removeprefix("0x")[-8:]
@@ -167,7 +166,7 @@ def validate(raw):
             if not bind["target"].startswith(("/var/lib/", "/var/cache/", "/opt/")):
                 fail("APT persistence targets must be application directories under /var/lib, /var/cache or /opt")
             if bind["target"].startswith(("/var/lib/dpkg", "/var/lib/apt", "/var/lib/containers")):
-                fail("Package-manager and Podman storage cannot be persistent NFS mounts")
+                fail("Package-manager and Podman storage must not be redirected into appdata")
             if any(bind["target"] == p or bind["target"].startswith(p + "/") or p.startswith(bind["target"] + "/") for p in mounts):
                 fail("Persistent targets must not overlap")
             mounts.add(bind["target"])
@@ -211,4 +210,4 @@ def validate(raw):
 
 
 def client_spec(cfg, client):
-    return {**client, **{k: cfg[k] for k in ("server_ip", "control_port", "app_update_minutes", "boot_timeout_seconds", "overlay_size", "podman_size", "dns", "ssh_authorized_keys")}}
+    return {**client, **{k: cfg[k] for k in ("server_ip", "control_port", "app_update_minutes", "boot_timeout_seconds", "dns", "ssh_authorized_keys")}}
