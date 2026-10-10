@@ -13,4 +13,25 @@ mountroot()
         echo "PXE Fleet: network/NFS root unavailable; retrying in 10 seconds" >&2
         sleep 10
     done
+    mode=nfs
+    size=50%
+    # The kernel command line is deliberately split into words.
+    # shellcheck disable=SC2013
+    for argument in $(cat /proc/cmdline); do
+        case "$argument" in
+            fleet.os_storage=*) mode=${argument#*=} ;;
+            fleet.ram_root_size=*) size=${argument#*=} ;;
+        esac
+    done
+    if [ "$mode" = ram ]; then
+        # Complete the copy before init-bottom moves /run and /dev into rootmnt.
+        # Do not let a copy/mount failure fall through into booting from NFS.
+        # rootmnt is exported by initramfs-tools' init.
+        # shellcheck disable=SC2154
+        if ! /bin/fleet-ram-root "${rootmnt}" "$size"; then
+            while :; do
+                panic "PXE Fleet: RAM root failed; check ram_root_size and available memory"
+            done
+        fi
+    fi
 }

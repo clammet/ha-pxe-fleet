@@ -110,7 +110,11 @@ def validate(raw):
         fail("Configure at least one client")
     serials, ips, hosts = set(), set(), set()
     for c in clients:
-        keys(c, "serial ip hostname model boot_options sd_updates container_storage_gib apt containers", "client")
+        keys(c, "serial ip hostname model boot_options sd_updates os_storage ram_root_size ram_data_size ram_container_size container_storage_gib apt containers", "client")
+        if c.setdefault("os_storage", "nfs") not in ("nfs", "ram"):
+            fail("os_storage must be nfs or ram")
+        for key, default in (("ram_root_size", "50%"), ("ram_data_size", "10%"), ("ram_container_size", "25%")):
+            string(c.setdefault(key, default), r"(?:[1-9][0-9]*[MG]|[1-9][0-9]?%)", key)
         c["container_storage_gib"] = integer(c.get("container_storage_gib", 8), 1, 1024, "container_storage_gib")
         if type(c.setdefault("sd_updates", True)) is not bool:
             fail("sd_updates must be a boolean")

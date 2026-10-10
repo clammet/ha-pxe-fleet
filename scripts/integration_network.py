@@ -5,6 +5,7 @@ import sys
 import time
 import tarfile
 import os
+import shutil
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "pxe_fleet"))
 from fleet.config import validate
@@ -106,7 +107,63 @@ try:
     (store.path / "tftp/probe").write_text("boot payload")
     result = subprocess.check_output(["curl", "--fail", "--silent", f"tftp://{ip}/probe"], text=True)
     assert result == "boot payload"
-    print("NFS retry, persistent writable OS, ext4-over-NFS Podman images/layers, appdata and TFTP passed", flush=True)
+    # Create a RAM client and use the actual initramfs copy/unmount helper.
+    ramcfg = validate({"server_ip": ip, "clients": [{"serial": "87654321", "ip": "192.0.2.3", "hostname": "ram-test", "model": "pi4", "os_storage": "ram"}]})
+    store.register(ramcfg)
+    store.state["clients"]["87654321"]["client"]["ip"] = ip
+    ramroot = store.root("87654321", generation)
+    (ramroot / "bin").mkdir(parents=True)
+    shutil.copy2("/bin/busybox", ramroot / "bin/busybox")
+    (ramroot / "system-file").write_text("RAM factory version")
+    (ramroot / "linked").symlink_to("system-file")
+    os.link(ramroot / "system-file", ramroot / "hardlinked")
+    (ramroot / "system-file").chmod(0o640)
+    write_json(ramroot.parent / "manifest.json", {"client": ramcfg["clients"][0]})
+    services.exports()
+    shutil.copy2("/bin/cp", "/bin/fleet-copy")
+    Path("/mnt/ram").mkdir(exist_ok=True)
+    run(["mount", "-t", "nfs", "-o", "vers=4.1,ro,hard", f"{ip}:/87654321/roots/{generation}", "/mnt/ram"])
+    mounts.append("/mnt/ram")
+    # A too-small root must fail without booting a partial tree or writing NFS.
+    failed = subprocess.run(["sh", "/workspace/pxe_fleet/assets/fleet-ram-root", "/mnt/ram", "1M"], capture_output=True)
+    assert failed.returncode != 0
+    assert subprocess.check_output(["findmnt", "-n", "-o", "FSTYPE", "--mountpoint", "/mnt/ram"], text=True).strip() == "nfs4"
+    assert not Path("/mnt/ram.fleet-ram").exists()
+    run(["sh", "/workspace/pxe_fleet/assets/fleet-ram-root", "/mnt/ram", "32M"])
+    assert subprocess.check_output(["findmnt", "-n", "-o", "FSTYPE", "--mountpoint", "/mnt/ram"], text=True).strip() == "tmpfs"
+    ram = Path("/mnt/ram")
+    assert (ram / "linked").is_symlink()
+    assert (ram / "system-file").stat().st_ino == (ram / "hardlinked").stat().st_ino
+    assert (ram / "system-file").stat().st_mode & 0o777 == 0o640
+    for name, size in (("appdata", "32M"), ("var/lib/containers", "128M")):
+        target = ram / name
+        target.mkdir(parents=True)
+        run(["mount", "-t", "tmpfs", "-o", "size=" + size, "tmpfs", target])
+        mounts.append(str(target))
+    ram_podman = ["podman", "--root", str(ram / "var/lib/containers/storage"), "--runroot", "/run/fleet-ram-test",
+                  "--storage-driver", "overlay", "--cgroup-manager", "cgroupfs", "--events-backend", "file"]
+    run(ram_podman + ["import", "/tmp/container.tar", "localhost/fleet-ram-test:latest"])
+    # Disconnect every NFS client mount before stopping the isolated NFS server.
+    for target in ("/mnt/containers", "/mnt/data", "/mnt/os", "/mnt/late"):
+        run(["umount", target])
+        mounts.remove(target)
+    services.close()
+    run(["rpc.nfsd", "0"])
+    assert subprocess.run(["findmnt", "-rn", "-t", "nfs,nfs4"], stdout=subprocess.DEVNULL).returncode == 1
+    run(["chroot", ram, "/bin/busybox", "sh", "-c", "echo updated > /system-file; echo runtime-data > /appdata/value; /bin/busybox cat /linked"])
+    assert (ramroot / "system-file").read_text() == "RAM factory version"
+    result = subprocess.check_output(ram_podman + ["run", "--rm", "--network", "none", "--cgroups", "disabled",
+        "--security-opt", "seccomp=unconfined", "-v", str(ram / "appdata") + ":/data", "localhost/fleet-ram-test:latest",
+        "/bin/busybox", "sh", "-c", "/bin/busybox cat /data/value; echo from-container > /data/container"], text=True)
+    assert result.strip() == "runtime-data"
+    assert (ram / "appdata/container").read_text().strip() == "from-container"
+    for target in (str(ram / "var/lib/containers"), str(ram / "appdata"), str(ram)):
+        run(["umount", target])
+        mounts.remove(target)
+    # Fresh RAM starts empty; no write-through or hidden synchronization.
+    assert not (ram / "system-file").exists()
+    assert not (store.path / "appdata/87654321/.fleet/podman.ext4").exists()
+    print("NFS persistence/retry/TFTP and complete RAM OS, appdata and Podman after NFS shutdown passed", flush=True)
 finally:
     if retry is not None and retry.poll() is None:
         retry.kill()

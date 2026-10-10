@@ -126,6 +126,7 @@ class SDUpdateTests(unittest.TestCase):
             self.assertEqual(manager.handle(self.reply, True), "tryboot")
             self.assertEqual(manager.handle(self.reply, True), "tryboot")
             self.assertEqual(download.call_count, 1)
+
             trial = self.manager({**self.identity, "partition": 3, "tryboot": True}, "new-boot")
             self.assertTrue(trial.trial)
             self.assertEqual(trial.handle(self.reply, False), "wait")
@@ -140,6 +141,23 @@ class SDUpdateTests(unittest.TestCase):
                     self.assertEqual(trial.handle(self.reply, True), "ready")
                 write.assert_not_called()
             self.assertEqual(download.call_count, 1)
+
+    def test_ram_trial_recovers_from_controller_journal_without_local_state(self):
+        durable = {"failed": {}, "pending": None, "retry": 0}
+        def persist(value):
+            nonlocal durable
+            durable = json.loads(json.dumps(value))
+        with patch("fleet.sdclient.open_card", self.card), patch("fleet.sdclient.RUNTIME", self.path), patch("fleet.sdclient.download", side_effect=self.fake_download), patch("fleet.sdclient.save", side_effect=AssertionError("RAM client wrote a local journal")):
+            manager = sdclient.Manager(self.spec, self.identity, self.image, self.state, "old-boot", initial_state=durable, persist=persist)
+            self.assertEqual(manager.handle(self.reply, True), "tryboot")
+            trial_id = {**self.identity, "partition": 3, "tryboot": True}
+            trial = sdclient.Manager(self.spec, trial_id, self.image, self.state, "new-boot", initial_state=durable, persist=persist)
+            self.assertTrue(trial.trial)
+            self.assertEqual(trial.handle(self.reply, True), "ready")
+            self.assertIsNone(durable["pending"])
+            self.assertFalse(self.state.exists())
+            with self.card(None, trial_id) as card:
+                self.assertEqual(card.active(), 3)
 
     def test_failed_trial_is_quarantined_and_explicit_retry_releases_it(self):
         with patch("fleet.sdclient.open_card", self.card), patch("fleet.sdclient.RUNTIME", self.path), patch("fleet.sdclient.download", side_effect=self.fake_download) as download:

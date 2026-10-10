@@ -42,6 +42,7 @@ with builder.base(release, args.arch) as (base, fingerprint):
         assert "scripts/init-bottom/fleet-overlay" not in listing
         assert "scripts/fleet" in listing and "scripts/nfs" in listing
         assert "mount.nfs" in listing
+        assert "bin/fleet-copy" in listing and "bin/fleet-ram-root" in listing
         chroot(base, "unmkinitramfs", "/boot/firmware/fleet-initrd-" + flavor, "/tmp/fleet-initrd-check")
         helpers = list((base / "tmp/fleet-initrd-check").rglob("nfsmount"))
         assert any(p.is_file() and b"exec /sbin/mount.nfs" in p.read_bytes() for p in helpers)

@@ -52,6 +52,9 @@ def handler(store, cfg):
                 shutil.copyfileobj(stream, self.wfile, 1024 * 1024)
 
         def do_POST(self):
+            if "/sd-state/" in self.path:
+                self.sd_state()
+                return
             match = re.fullmatch(r"/v1/clients/([a-f0-9]{8})", self.path)
             if not match or match[1] not in store.state["clients"]:
                 self.send_error(404)
@@ -101,6 +104,62 @@ def handler(store, cfg):
                     seen[key] = time.monotonic()
                     self.server.seen = {k: v for k, v in seen.items() if time.monotonic() - v < 3600}
                 reply = canonical(store.report(serial, status, cfg["boot_timeout_seconds"]))
+            except (ValueError, KeyError, TypeError):
+                self.send_error(400)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(reply)))
+            self.send_header("X-Fleet-Signature", hmac.new(token, reply, hashlib.sha256).hexdigest())
+            self.end_headers()
+            self.wfile.write(reply)
+
+        def sd_state(self):
+            # RAM clients have no persistent client filesystem. Keep only their
+            # tiny SD transaction journal on the controller, accessed via HTTP.
+            match = re.fullmatch(r"/v1/clients/([a-f0-9]{8})/sd-state/([a-f0-9]{32})", self.path)
+            if not match or match[1] not in store.state["clients"]:
+                self.send_error(404)
+                return
+            serial, card_id = match.groups()
+            entry = store.state["clients"][serial]
+            if self.client_address[0] != entry["client"]["ip"] or entry["client"].get("os_storage", "nfs") != "ram":
+                self.send_error(403)
+                return
+            try:
+                size = int(self.headers.get("Content-Length", "0"))
+                if not 0 < size <= 16384:
+                    raise ValueError("Invalid request length")
+                body = self.rfile.read(size)
+                token = entry["token"].encode()
+                signed = ("POST " + self.path + "\n").encode() + body
+                signature = hmac.new(token, signed, hashlib.sha256).hexdigest()
+                if not hmac.compare_digest(signature, self.headers.get("X-Fleet-Signature", "")):
+                    self.send_error(403)
+                    return
+                request = json.loads(body)
+                if not isinstance(request, dict) or not re.fullmatch(r"[a-f0-9]{48}", str(request.get("nonce", ""))):
+                    raise ValueError("Invalid SD journal request")
+                with store.lock:
+                    journal = entry.get("sd_journal", {"version": 0, "card_id": None, "state": None})
+                    if "state" in request:
+                        if not isinstance(request["state"], dict) or type(request.get("version")) is not int:
+                            raise ValueError("Invalid SD journal state")
+                        # Persisted compare-and-swap prevents replayed writes,
+                        # including replays after a controller restart.
+                        if request["version"] != journal["version"]:
+                            self.send_error(409)
+                            return
+                        updated = {"card_id": card_id, "version": journal["version"] + 1, "state": request["state"]}
+                        entry["sd_journal"] = updated
+                        try:
+                            store.save()
+                        except BaseException:
+                            entry["sd_journal"] = journal
+                            raise
+                        journal = updated
+                    reply = canonical({"nonce": request["nonce"], "version": journal["version"],
+                                       "state": journal["state"] if journal["card_id"] == card_id else None})
             except (ValueError, KeyError, TypeError):
                 self.send_error(400)
                 return

@@ -51,10 +51,11 @@ def render_quadlet(app):
     return "\n".join(lines)
 
 
-def require_appdata():
+def require_appdata(spec):
     result = json.loads(output(["findmnt", "--json", "--mountpoint", str(DATA), "-o", "FSTYPE,TARGET"]))
-    if not result.get("filesystems") or result["filesystems"][0]["fstype"] not in ("nfs", "nfs4"):
-        raise RuntimeError("Refusing to start applications without the persistent NFS mount")
+    expected = ("tmpfs",) if spec.get("os_storage", "nfs") == "ram" else ("nfs", "nfs4")
+    if not result.get("filesystems") or result["filesystems"][0]["fstype"] not in expected:
+        raise RuntimeError("Appdata mount does not match this client's storage mode")
 
 
 def require_container_storage(spec):
@@ -62,6 +63,10 @@ def require_container_storage(spec):
         return
     result = json.loads(output(["findmnt", "--json", "--mountpoint", "/var/lib/containers", "-o", "FSTYPE,SOURCE"]))
     mounts = result.get("filesystems", [])
+    if spec.get("os_storage", "nfs") == "ram":
+        if len(mounts) != 1 or mounts[0]["fstype"] != "tmpfs":
+            raise RuntimeError("Podman requires its dedicated tmpfs mount in RAM mode")
+        return
     if len(mounts) != 1 or mounts[0]["fstype"] != "ext4" or not mounts[0]["source"].startswith("/dev/loop"):
         raise RuntimeError("Podman requires its NFS-backed ext4 disk; refusing RAM/direct-NFS storage")
     backing = output(["losetup", "--noheadings", "--output", "BACK-FILE", mounts[0]["source"]])
@@ -171,7 +176,7 @@ def stage(spec):
 
 
 def prepare(spec):
-    require_appdata()
+    require_appdata(spec)
     require_container_storage(spec)
     prepare_accounts(spec)
     state = data_directory(".fleet")

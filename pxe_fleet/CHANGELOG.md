@@ -1,3 +1,14 @@
+## 0.5.0
+
+- Add per-client `os_storage: nfs|ram`, fixed at first registration. Ignore and
+  log later attempts to change it; existing clients keep NFS storage.
+- RAM mode copies the complete OS at boot and disconnects NFS. Separate RAM
+  filesystems hold appdata and Podman images/layers, with configurable limits.
+  Runtime data and updates are deliberately lost on reboot; there is no writeback.
+- Keep automatic SD update transactions durable over authenticated HTTP for RAM
+  clients, without persistent client storage or a runtime NFS dependency.
+- Test NFS persistence and run RAM OS/appdata/Podman after stopping the NFS server.
+
 ## 0.4.0
 
 - Reuse prepared bases by upstream image SHA256; unchanged APT plans skip rebuilds.

@@ -16,7 +16,7 @@ from fleet.client import exchange, data_directory, apt_install
 from fleet.server import handler
 from fleet.state import Store
 from fleet.util import canonical
-from fleet.sdclient import download
+from fleet.sdclient import ControllerJournal, download
 from test_fleet import config
 
 
@@ -43,6 +43,44 @@ class ProtocolTests(unittest.TestCase):
 
     def status(self):
         return {"generation": self.generation, "healthy": True, "boot_id": "11111111-1111-1111-1111-111111111111"}
+
+    def test_ram_sd_journal_survives_reboot_and_rejects_stale_writes(self):
+        self.entry["client"]["os_storage"] = "ram"
+        journal = ControllerJournal(self.spec, "a" * 32)
+        self.assertIsNone(journal.exchange())
+        stale = ControllerJournal(self.spec, "a" * 32)
+        stale.exchange()
+        state = {"failed": {}, "pending": {"revision": "d" * 64, "slot": 3}, "retry": 0}
+        journal.save(state)
+        self.assertEqual(Store(self.temp.name).state["clients"][self.serial]["sd_journal"]["state"], state)
+        restarted = ControllerJournal(self.spec, "a" * 32)
+        self.assertEqual(restarted.exchange(), state)
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            stale.exchange({"pending": None})
+        self.assertEqual(error.exception.code, 409)
+        self.assertEqual(restarted.exchange(), state)
+        self.assertIsNone(ControllerJournal(self.spec, "b" * 32).exchange())
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            ControllerJournal({**self.spec, "token": "wrong"}, "a" * 32).exchange()
+        self.assertEqual(error.exception.code, 403)
+
+    def test_sd_journal_requires_ram_client_and_restarts_agent_on_failed_save(self):
+        journal = ControllerJournal(self.spec, "a" * 32)
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            journal.exchange()
+        self.assertEqual(error.exception.code, 403)
+        with patch.object(journal, "exchange", side_effect=OSError("controller unavailable")):
+            with self.assertRaises(SystemExit):
+                journal.save({"pending": {"slot": 3}})
+
+    def test_sd_journal_rejects_replayed_signed_response(self):
+        payload = canonical({"nonce": "old", "version": 1, "state": None})
+        response = io.BytesIO(payload)
+        response.url = f"http://127.0.0.1:{self.spec['control_port']}/v1/clients/{self.serial}/sd-state/" + "a" * 32
+        response.headers = {"X-Fleet-Signature": hmac.new(self.entry["token"].encode(), payload, hashlib.sha256).hexdigest()}
+        with patch("fleet.sdclient.urllib.request.urlopen", return_value=response):
+            with self.assertRaisesRegex(ValueError, "Replayed"):
+                ControllerJournal(self.spec, "a" * 32).exchange()
 
     def test_authenticated_exchange_and_wrong_key(self):
         reply = exchange(self.spec, self.status())

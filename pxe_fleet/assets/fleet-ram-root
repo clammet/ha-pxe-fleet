@@ -1,0 +1,22 @@
+#!/bin/sh
+# Called inside initramfs after mounting the generation read-only over NFS.
+set -eu
+rootmnt=$1
+size=$2
+ram="${rootmnt}.fleet-ram"
+mkdir -p "$ram"
+mount -t tmpfs -o "mode=0755,size=$size" fleet-root "$ram"
+cleanup()
+{
+    umount "$ram" || true
+    rmdir "$ram" || true
+}
+trap cleanup EXIT
+echo "PXE Fleet: copying the complete OS into RAM (limit $size)" >&2
+/bin/fleet-copy -a --one-file-system "$rootmnt/." "$ram/"
+# A normal unmount is intentional: a lazy unmount could conceal live NFS users.
+umount "$rootmnt"
+mount --move "$ram" "$rootmnt"
+trap - EXIT
+rmdir "$ram"
+echo "PXE Fleet: RAM root ready; the boot NFS mount has been disconnected" >&2

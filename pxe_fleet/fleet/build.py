@@ -93,6 +93,7 @@ def install_initramfs(root):
         ("fleet-nfs", "etc/initramfs-tools/scripts/fleet"),
         ("fleet-hook", "etc/initramfs-tools/hooks/fleet"),
         ("fleet-nfsmount", "usr/local/lib/fleet-nfsmount"),
+        ("fleet-ram-root", "usr/local/lib/fleet-ram-root"),
     ):
         put(root, target, (ASSETS / source).read_bytes(), 0o755)
     (root / "etc/initramfs-tools/scripts/init-bottom/fleet-overlay").unlink(missing_ok=True)
@@ -179,11 +180,17 @@ def prepare_client(root, spec, generation, token, data_export):
     put(root, "etc/hostname", spec["hostname"] + "\n")
     put(root, "etc/hosts", f"127.0.0.1 localhost\n127.0.1.1 {spec['hostname']}\n::1 localhost\n")
     put(root, "etc/resolv.conf", "".join(f"nameserver {ip}\n" for ip in spec["dns"]))
-    mounts = f"{spec['server_ip']}:{data_export} /appdata nfs4 rw,hard,vers=4.1,proto=tcp,_netdev,noatime 0 0\n"
+    if spec.get("os_storage", "nfs") == "ram":
+        mounts = f"tmpfs /appdata tmpfs mode=0755,size={spec['ram_data_size']},nosuid,nodev 0 0\n"
+    else:
+        mounts = f"{spec['server_ip']}:{data_export} /appdata nfs4 rw,hard,vers=4.1,proto=tcp,_netdev,noatime 0 0\n"
     if spec["containers"]:
-        # ext4 supplies OverlayFS/xattr semantics; every backing byte lives on
-        # the NFS server. systemd orders shutdown before unmounting appdata.
-        mounts += "/appdata/.fleet/podman.ext4 /var/lib/containers ext4 loop,_netdev,noatime,x-systemd.requires-mounts-for=/appdata 0 0\n"
+        if spec.get("os_storage", "nfs") == "ram":
+            mounts += f"tmpfs /var/lib/containers tmpfs mode=0700,size={spec['ram_container_size']},nosuid,nodev 0 0\n"
+        else:
+            # ext4 supplies OverlayFS/xattr semantics; every backing byte lives on
+            # the NFS server. systemd orders shutdown before unmounting appdata.
+            mounts += "/appdata/.fleet/podman.ext4 /var/lib/containers ext4 loop,_netdev,noatime,x-systemd.requires-mounts-for=/appdata 0 0\n"
     put(root, "etc/fstab", mounts)
     for path in ("appdata", "var/lib/containers"):
         (root / path).mkdir(parents=True, exist_ok=True)

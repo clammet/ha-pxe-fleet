@@ -3,12 +3,13 @@
 The card contains Raspberry Pi firmware, U-Boot and a small retry script. It
 contains **no deployed OS, application or app data**. On each boot it fetches a
 complete kernel/initramfs generation from the add-on, verifies file sizes and
-SHA256 hashes, and starts the writable NFS root and separate
-persistent `/appdata` mount.
+SHA256 hashes, and starts the selected OS storage mode: persistent NFS or a
+complete RAM copy. `/appdata` uses a separate mount in the same storage mode.
 
 If HA is still starting, DHCP fails, or a download is interrupted, the loader
 retries indefinitely. If TFTP becomes ready before NFS does, the initramfs keeps
-retrying the NFS mount. Normal boots do not write SD. When the firmware, device
+retrying the NFS mount. RAM mode disconnects that mount after copying the OS;
+its OS, appdata and containers then run without NFS. Normal boots do not write SD. When the firmware, device
 trees, U-Boot or retry script changes, the agent automatically stages a new boot
 slot and tests it with Raspberry Pi's one-shot `tryboot` mode. U-Boot's
 environment remains in RAM; there is no persistent boot counter or saved environment.
@@ -187,3 +188,8 @@ Ethernet link, and HA's TFTP UDP 69/NFS TCP 2049 availability. The add-on must
 have completed a generation before `<serial>/boot.env` is available. A model
 mismatch or hash mismatch is rejected and retried. To return to native boot on
 a capable board, remove the SD card and configure its normal Ethernet boot path.
+
+RAM clients store the SD transaction journal on the controller using signed HTTP,
+rather than volatile appdata. The controller must be reachable to stage/confirm an
+SD update, but running applications do not depend on NFS or this journal service.
+The creation-time storage choice is documented in the [add-on guide](../pxe_fleet/DOCS.md#client-storage-mode).

@@ -12,7 +12,7 @@ LOG = logging.getLogger(__name__)
 
 
 def container_disk(data, client, token):
-    if not client["containers"]:
+    if not client["containers"] or client.get("os_storage", "nfs") == "ram":
         return
     state = data / ".fleet"
     if state.is_symlink():

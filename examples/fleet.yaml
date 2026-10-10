@@ -18,7 +18,15 @@ clients:
     # Format-v2 SD cards automatically update firmware/U-Boot through A/B slots.
     # Native clients never write an inserted SD card.
     sd_updates: true
-    # Sparse ext4 disk on NFS for Podman; created once, retained across OS upgrades.
+    # Creation-time choice: nfs (persistent) or ram (entire OS, appdata and Podman
+    # in RAM; no NFS mounts after boot; all runtime data lost on reboot).
+    # Later mode changes are ignored. Existing clients stay in their original mode.
+    os_storage: nfs
+    # RAM-mode capacity limits only; leave enough memory for applications.
+    # ram_root_size: "50%"
+    # ram_data_size: "10%"
+    # ram_container_size: "25%"
+    # NFS mode only: sparse ext4 disk for Podman; created once, retained across OS upgrades.
     container_storage_gib: 8
     # For the first SD boot, also pass peripheral options when making the card.
     boot_options:

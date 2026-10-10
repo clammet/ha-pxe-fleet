@@ -36,7 +36,7 @@ hex digits of its hardware serial. Full 16-digit serials are accepted and
 normalized; duplicate suffixes are rejected. The control endpoint also checks
 the reserved client IP. Keep the server address fixed. Changing a server address
 requires updating network boot configuration and rebooting clients manually;
-already booted clients still depend on their original NFS server address.
+already booted NFS-mode clients still depend on their original NFS server address.
 
 Allow UDP 69 and TFTP's negotiated UDP transfers, TCP 2049 for NFSv4.1, and the
 configured control TCP port (8099 by default). Do not run another NFS/TFTP server
@@ -60,23 +60,71 @@ not a secure-boot system. Root exports are restricted to each reserved address.
 | `image` | `{}` | Optional fixed ARM64 HTTPS image URL and SHA256 |
 | `image_armhf` | `{}` | Optional fixed 32-bit Raspberry Pi OS image URL and SHA256 for Pi 1/2 |
 
-Each client has a writable NFS OS root and a separate writable appdata export.
-OS files and package databases persist across ordinary reboots; replacing the OS
-generation replaces that root. There is no tmpfs root overlay. Linux uses normal
-reclaimable file caches and writes dirty data back to the NFS server; the server
-exports use `sync` and clients use `hard` mounts. This is not a special RAM cache
-or a promise that every write syscall is synchronously durable: applications must
-still use their normal fsync/transaction semantics.
+## Client storage mode
 
-Small runtime files and the bounded volatile journal remain in RAM. No swap is
-configured. Pi 1 still needs ARMv6-compatible applications and sufficient process
-memory. Allow space for a prepared base, a private update copy, downloaded images,
-and retained per-client roots (roughly 20 GB of build/cache headroom per architecture,
-plus client storage). All backing files live under the add-on's `/data/fleet`.
+Set `os_storage` under each client **before the add-on first registers it**.
+Registration stores the choice in the controller's durable state. Later changes
+are ignored with a warning; they do not migrate data, rebuild a root or reboot a
+client solely because the requested mode changed. Existing clients without the
+setting remain `nfs`. Removing and re-adding the same serial also preserves its
+original choice because client state is retained.
 
-The old `overlay_size` and `podman_size` settings have been removed; remove them
-from `fleet.yaml`. Existing deployments pick up the new mount layout when they
-boot a newly built generation; SD format-v2 cards do not need reflashing for this.
+| Client setting | Default | Meaning |
+| --- | --- | --- |
+| `os_storage` | `nfs` | Creation-time choice: `nfs` or `ram` |
+| `ram_root_size` | `50%` | RAM mode: maximum space for the complete OS and its changes |
+| `ram_data_size` | `10%` | RAM mode: maximum space for application data |
+| `ram_container_size` | `25%` | RAM mode: maximum space for Podman images and writable layers |
+| `container_storage_gib` | 8 | NFS mode: initial Podman disk capacity in GiB |
+
+RAM limits accept strings such as `512M`, `4G` or `50%` (1–99% of physical RAM).
+They are maximum capacities, not reserved allocations. Leave memory for processes,
+the kernel, initramfs and runtime files. Limits are independent: oversized totals
+can exhaust physical RAM before a filesystem reaches its own limit. RAM size
+settings can be adjusted through a new OS generation; the storage mode stays fixed.
+
+**NFS mode:** Each client has a writable NFS OS root and separate writable appdata.
+System files, libraries, APT databases and package updates persist across ordinary
+reboots. A replacement generation replaces the root. Linux uses its normal
+reclaimable file caches and writes dirty data back to the server; exports use
+`sync` and clients use `hard` mounts. Applications still need their normal
+fsync/transaction semantics. The client depends on NFS while running.
+
+**RAM mode:** Initramfs mounts the generation read-only, copies the **entire** root
+into tmpfs, then fully unmounts NFS before starting the OS. There is no NFS lower
+layer or on-demand fetching of OS files. `/appdata` and `/var/lib/containers` are
+separate tmpfs mounts; no NFS filesystem remains mounted. Podman downloads images
+from the registry on each boot. Once applications have started, losing NFS or
+the controller does not stop them. Application-specific network services may
+still be required; registry/APT updates need their repositories, and the next
+boot always needs the controller's boot files and OS export.
+
+RAM application data starts fresh each boot. APT data directories are seeded from
+the packaged defaults; container volumes start empty. The existing `apt.persistent`
+and container `volumes` mappings still select isolated appdata directories, but
+**they are volatile in RAM mode**. There is no checkpointing, write-through,
+background synchronization or import from the server's appdata. Runtime APT
+updates, downloaded container images, logs, appdata, registry login credentials
+and SSH host keys are lost on reboot, including automatic update reboots.
+The next boot loads the centrally built OS/apps and pulls configured containers.
+Use this mode for stateless/reconstructible workloads.
+
+The whole prepared OS must fit in `ram_root_size`, with additional room for APT
+updates. Tmpfs contents consume RAM until deleted/unmounted; they cannot be
+reclaimed like clean NFS page cache. No swap is configured. An incomplete copy
+fails boot instead of falling back to NFS or starting a partial OS. Stock prepared
+images are much too large for the smallest Pis; NFS mode is the practical choice
+for Pi 1/2 and other boards without enough memory. Check the deployed root size
+and actual workload before choosing RAM mode.
+
+Small runtime files and the bounded 32 MiB volatile journal use RAM in both modes.
+On the host, allow a prepared base, a private update copy, downloaded images and
+retained per-client roots (roughly 20 GB of build/cache headroom per architecture,
+plus NFS client storage). Backing files live under the add-on's `/data/fleet`.
+
+The old global `overlay_size` and `podman_size` options remain unsupported. This
+RAM mode is a complete RAM root, not the former read-only NFS plus RAM overlay.
+SD format-v2 cards need no manual reflash to select the new boot behavior.
 
 ## APT applications
 
@@ -101,9 +149,9 @@ Each client has an `apt` mapping:
 An application package should supply its own configuration and service unit.
 Configure that application to write durable state into its persistent directory.
 Keep package-manager databases in the disposable OS root; do not redirect them
-into appdata. They are now disk-backed on NFS and survive reboots of that root.
+into appdata. They follow the OS storage mode: persistent on NFS, volatile in RAM.
 Application logs should use the bounded journal unless durable logging is needed.
-Configuration under `/etc` survives reboots but is replaced with a new generation;
+Configuration under `/etc` survives ordinary reboots only in NFS mode and is replaced with a new generation;
 package it or have the application read it from its persistent directory.
 
 The add-on installs configured APT applications on local host storage while
@@ -111,9 +159,10 @@ building a private OS generation, using QEMU for cross-architecture scripts.
 Package-provided initial data is seeded into appdata only on first creation.
 Existing appdata is never reseeded. The Pi starts these preinstalled versions
 without downloading them again. At the configured interval it pulls application
-updates with APT and installs them into its writable NFS root. Those updates
-survive reboot; they are not held in RAM or merged into the host's cached base.
-This client-side update path trades NFS write speed for low RAM use.
+updates with APT and installs them into its selected root. NFS mode retains them
+across reboots; RAM mode loses them on reboot. Neither path merges live changes
+into the host's cached base. The host preinstalls current repository packages
+when it builds the next generation.
 
 OS/security updates run on the host against a private copy of its prepared base,
 then produce a replacement client generation. Client kernel updates are pinned
@@ -136,7 +185,7 @@ are `environment` (string values), `command` (argument list), `ports`, `devices`
 `read_only` boolean. Use a mutable tag for automatic image updates; a digest
 deliberately pins the image.
 
-The add-on generates rootful Podman Quadlets. Each client with containers gets
+The add-on generates rootful Podman Quadlets. In **NFS mode**, each client with containers gets
 one sparse ext4 disk-image file at `/appdata/.fleet/podman.ext4`, created and
 formatted once on the add-on host. The Pi mounts that file through NFS with a
 loop device at `/var/lib/containers`. Podman's OverlayFS storage therefore sees
@@ -163,13 +212,21 @@ built-in rollback if restart fails.
 The container disk is not rolled back with the OS; a Podman storage database
 upgrade can prevent an older Podman version from using it after an OS rollback.
 
+**RAM mode** uses a dedicated tmpfs at `/var/lib/containers`, bounded by
+`ram_container_size`. It creates no ext4 image on NFS. Images and writable layers
+are downloaded/created anew on every boot, and appdata volumes are also volatile.
+The client checks that appdata and container mounts match its configured mode
+before starting applications.
+
 For a private registry, log in on the Pi with:
 
 ```sh
 podman login --authfile /appdata/.fleet/registry-auth.json registry.example.org
 ```
 
-The auth file persists across OS resets; Quadlets and auto-update both use it.
+Quadlets and auto-update both use this auth file. It persists across OS resets
+in NFS mode. RAM mode loses it on reboot, so private registries need a separate
+credential provisioning mechanism before containers can start unattended.
 
 ## Update and recovery behavior
 
@@ -189,14 +246,16 @@ The auth file persists across OS resets; Quadlets and auto-update both use it.
    cache is never a client's root and is never exported. Updating one architecture
    does not change the cache or existing roots for another architecture.
 4. Copy the prepared OS into a new per-client generation and install its APT
-   sources, service accounts and application packages offline. Export it read-write to that Pi and
+   sources, service accounts and application packages offline. Export it read-write
+   for an NFS client or read-only for a RAM client, and
    publish a complete immutable TFTP payload. An atomic `config.txt` selects the
    payload using `os_prefix`, including its matching kernel, modules and initramfs.
    SD loaders read an atomic `boot.env` pointing to the matching immutable boot payload,
    with a U-Boot-compatible kernel plus file sizes and SHA256 hashes. Changed SD
    firmware/device trees/U-Boot are staged in the inactive card slot before reboot;
    an SD trial cannot confirm the OS until the boot slot is committed. NFS root
-   mounting retries indefinitely if exports are not ready yet.
+   mounting retries indefinitely if exports are not ready yet. RAM clients copy
+   this root and disconnect the NFS mount before starting the OS.
 5. The running client receives a signed reboot request. It finishes any running
    application update first. After reboot, mounts and apps must be ready and the
    declared services active for at least 60 seconds before confirmation.
@@ -208,6 +267,13 @@ The auth file persists across OS resets; Quadlets and auto-update both use it.
    `boot_timeout_seconds` deadline even without an OS rollout. A failed trial
    retains the old selector and is quarantined; the retry command below also
    releases SD quarantine. See the SD guide for recovery-layer and EEPROM limits.
+
+RAM clients keep their small SD update transaction journal on the controller
+through signed HTTP requests with replay protection. This survives RAM resets
+without an NFS mount or routine SD writes. If the controller cannot acknowledge
+a journal change, the agent restarts and reloads it before continuing; running
+applications are unaffected. SD updates/confirmation require controller contact.
+NFS clients continue to keep this journal in their persistent appdata.
 
 Offline clients do not start the rollout timer until they report. On first
 deployment there is no known-good generation; failed preparation retries without
@@ -223,7 +289,8 @@ and data so an existing NFS-root client is not broken unexpectedly. Decommission
 the Pi before manually deleting retained client data. Low disk space blocks new
 builds and is reported in the log; running clients retain their current roots.
 
-OS rollback does not roll back appdata or APT/container registry versions.
+In NFS mode, OS rollback does not roll back appdata or APT/container registry
+versions. In RAM mode, rollback reboots and loses all runtime appdata.
 Database migrations can make old applications incompatible with newer data.
 Back up application data using application-consistent backups, and coordinate
 schema compatibility with application updates. HA backups of the add-on include
@@ -246,15 +313,17 @@ python3 -m fleet.ctl rollback 1234abcd
 
 `check` schedules an immediate OS build/check. `retry` also clears quarantined
 builds for one client. `rollback` requests the previous confirmed generation and
-quarantines the current one; it requires no pending rollout. Requests are queued
+quarantines the current one; it requires no pending rollout. RAM mode resets all
+volatile runtime state during either an update or a rollback. Requests are queued
 and their result appears in the log. The status command omits client secrets.
-Rebooting a Pi retains its NFS OS changes, installed application updates and
-Podman images. An OS replacement or rollback selects a different root; appdata,
-the container disk and SSH host identity remain intact.
+In NFS mode, rebooting retains OS changes, installed application updates and
+Podman images; OS replacement retains appdata, the container disk and SSH identity.
+In RAM mode, every reboot loses all of those runtime changes and application data.
 
 Restart the add-on to load edited configuration. Do not rename/delete exported
 root directories, run host-side APT against a live root, or move storage behind
-an NFS client. Normal client-side writes to that client's own root are expected.
+an NFS client. Normal client-side writes to an NFS-mode client's own root are expected. RAM-mode
+roots are read-only exports and are copied into client memory at boot.
 
 ## Design references
 
@@ -264,3 +333,5 @@ an NFS client. Normal client-side writes to that client's own root are expected.
 * [Linux OverlayFS requirements](https://www.kernel.org/doc/html/latest/filesystems/overlayfs.html)
 * [Podman Quadlet](https://docs.podman.io/en/latest/markdown/podman-systemd.unit.5.html)
 * [Podman auto-update](https://docs.podman.io/en/latest/markdown/podman-auto-update.1.html)
+
+* [Linux tmpfs memory and capacity semantics](https://www.kernel.org/doc/html/latest/filesystems/tmpfs.html)

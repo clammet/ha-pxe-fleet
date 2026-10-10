@@ -9,6 +9,7 @@ import logging
 import os
 from pathlib import Path
 import re
+import secrets
 import stat
 import tempfile
 import time
@@ -213,11 +214,48 @@ def download(spec, description, destination):
         raise ValueError("SD update download checksum mismatch")
 
 
+class ControllerJournal:
+    """Durable SD state for diskless RAM clients; never mounts NFS."""
+    def __init__(self, spec, card_id):
+        self.spec, self.card_id, self.version = spec, card_id, None
+
+    def exchange(self, state=None):
+        nonce = secrets.token_hex(24)
+        request = {"nonce": nonce}
+        if state is not None:
+            request.update(state=state, version=self.version)
+        body = canonical(request)
+        path = f"/v1/clients/{self.spec['serial']}/sd-state/{self.card_id}"
+        token = self.spec["token"].encode()
+        signature = hmac.new(token, ("POST " + path + "\n").encode() + body, hashlib.sha256).hexdigest()
+        url = f"http://{self.spec['server_ip']}:{self.spec['control_port']}" + path
+        request = urllib.request.Request(url, data=body, headers={"X-Fleet-Signature": signature})
+        with urllib.request.urlopen(request, timeout=20) as response:
+            payload = response.read(32769)
+            expected = hmac.new(token, payload, hashlib.sha256).hexdigest()
+            if response.url != url or len(payload) > 32768 or not hmac.compare_digest(response.headers.get("X-Fleet-Signature", ""), expected):
+                raise ValueError("Invalid SD journal response signature")
+        reply = json.loads(payload)
+        if reply.get("nonce") != nonce or type(reply.get("version")) is not int:
+            raise ValueError("Replayed or invalid SD journal response")
+        self.version = reply["version"]
+        return reply["state"]
+
+    def save(self, state):
+        try:
+            self.exchange(state)
+        except Exception as exc:
+            # Restart only the agent to reload authoritative state. Never carry
+            # on to tryboot with an unacknowledged journal or guessed version.
+            raise SystemExit("Cannot persist SD transaction; restarting fleet agent") from exc
+
+
 class Manager:
-    def __init__(self, spec, identity, device, state_path, boot_id):
+    def __init__(self, spec, identity, device, state_path, boot_id, initial_state=None, persist=None):
         self.spec, self.identity, self.device = spec, identity, device
         self.state_path, self.boot_id = state_path, boot_id
-        self.state = json.loads(state_path.read_text()) if state_path.exists() else {"failed": {}, "pending": None, "retry": 0}
+        self.persist = persist or (lambda value: save(self.state_path, value))
+        self.state = initial_state if initial_state is not None else (json.loads(state_path.read_text()) if state_path.exists() else {"failed": {}, "pending": None, "retry": 0})
         self.error = None
         with open_card(device, identity) as card:
             self.current = card.revision(identity["partition"])
@@ -229,7 +267,7 @@ class Manager:
                 if self.active == pending["slot"]:
                     # Power loss after selector commit but before NFS state save.
                     self.state["pending"] = None
-                    save(self.state_path, self.state)
+                    self.persist(self.state)
                     self.trial = False
             elif not self.trial:
                 self.fail(pending["revision"], pending["generation"], "SD trial returned to the previous slot")
@@ -237,7 +275,7 @@ class Manager:
             pending = self.state["pending"]
             if pending.get("trial_boot_id") != boot_id:
                 pending.update(trial_boot_id=boot_id, trial_started=time.monotonic())
-                save(self.state_path, self.state)
+                self.persist(self.state)
 
     def fail(self, revision, generation, message):
         self.state["failed"][revision] = generation
@@ -245,7 +283,7 @@ class Manager:
         self.state["pending"] = None
         self.state["failure"] = generation
         self.error = message
-        save(self.state_path, self.state)
+        self.persist(self.state)
         LOG.error("%s; revision %s is quarantined", message, revision)
 
     def report(self):
@@ -263,7 +301,7 @@ class Manager:
         retry = reply.get("sd_retry", 0)
         if type(retry) is int and retry > self.state["retry"]:
             self.state.update(failed={}, failure=None, retry=retry)
-            save(self.state_path, self.state)
+            self.persist(self.state)
         pending = self.state["pending"]
         if self.trial:
             if (not pending or self.current != pending["revision"] or
@@ -283,14 +321,14 @@ class Manager:
                 card.commit(pending["slot"], pending["revision"])
             self.active = pending["slot"]
             self.state.update(pending=None, failure=None)
-            save(self.state_path, self.state)
+            self.persist(self.state)
             self.trial = False
             LOG.info("Confirmed SD firmware revision %s", self.current)
             return "ready"
         description = reply.get("sd_update")
         if pending and pending["boot_id"] == self.boot_id and reply["desired"] != pending["generation"]:
             self.state["pending"] = pending = None
-            save(self.state_path, self.state)
+            self.persist(self.state)
         if not self.spec.get("sd_updates", True) or not description:
             return "ready"
         check_description(description, self.identity, reply["desired"])
@@ -300,12 +338,12 @@ class Manager:
             if (pending["revision"], pending["generation"]) == (description["revision"], reply["desired"]):
                 return "tryboot"  # Reboot command failed/restarted agent: no second write.
             self.state["pending"] = None
-            save(self.state_path, self.state)
+            self.persist(self.state)
         if description["revision"] in self.state["failed"]:
             # Also reject a later OS generation using the same failed firmware.
             if self.state.get("failure") != reply["desired"]:
                 self.state["failure"] = reply["desired"]
-                save(self.state_path, self.state)
+                self.persist(self.state)
             return "wait"
         if not healthy and not reply.get("reboot"):
             return "wait"
@@ -322,7 +360,7 @@ class Manager:
         self.state["pending"] = {"revision": description["revision"], "slot": destination,
                                  "generation": reply["desired"], "boot_id": self.boot_id}
         self.state["failure"] = None
-        save(self.state_path, self.state)
+        self.persist(self.state)
         LOG.info("Staged SD firmware %s in partition %s", description["revision"], destination)
         return "tryboot"
 
@@ -334,4 +372,9 @@ def detect(spec, boot_id):
     if identity["serial"] != spec["serial"] or ("pi3" if identity["model"] == "pi3plus" else identity["model"]) != spec["model"]:
         raise ValueError("SD card and deployed client configuration disagree")
     device = find_card(identity)
-    return Manager(spec, identity, device, Path("/appdata/.fleet") / ("sd-" + identity["card_id"] + ".json"), boot_id)
+    path = Path("/appdata/.fleet") / ("sd-" + identity["card_id"] + ".json")
+    if spec.get("os_storage", "nfs") == "ram":
+        journal = ControllerJournal(spec, identity["card_id"])
+        state = journal.exchange() or {"failed": {}, "pending": None, "retry": 0}
+        return Manager(spec, identity, device, path, boot_id, initial_state=state, persist=journal.save)
+    return Manager(spec, identity, device, path, boot_id)

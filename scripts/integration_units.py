@@ -48,6 +48,26 @@ try:
         installed = chroot(root, "dpkg-query", "-W", "-f=${Status}", "mosquitto", output=True)
         assert installed == "install ok installed"
         assert chroot(root, "id", "-u", "mosquitto", output=True) == "2100"
+    spec["os_storage"] = "ram"
+    prepare_client(root, spec, "e" * 24, "test-token", "/1234abcd/appdata")
+    with chroot_mounts(root):
+        for name in ("fstab-normal", "fstab-early", "fstab-late"):
+            shutil.rmtree(root / "tmp" / name)
+            (root / "tmp" / name).mkdir()
+        chroot(root, "/usr/lib/systemd/system-generators/systemd-fstab-generator",
+               "/tmp/fstab-normal", "/tmp/fstab-early", "/tmp/fstab-late")
+        for unit in ("appdata.mount", "var-lib-containers.mount"):
+            mount = (root / "tmp/fstab-normal" / unit).read_text()
+            assert "What=tmpfs" in mount and "Type=tmpfs" in mount
+            assert "_netdev" not in mount and "nfs" not in mount
+    # Verify the actual copy helper's ELF dependencies were included, not just
+    # its filename. Running it from the extracted initramfs catches missing libs.
+    chroot(root, "unmkinitramfs", "/boot/firmware/fleet-initrd-v8", "/tmp/ram-initrd")
+    helper = next((root / "tmp/ram-initrd").rglob("fleet-copy"))
+    initroot = helper.parent.parent
+    if initroot.name == "usr":
+        initroot = initroot.parent
+    run(["chroot", initroot, "/bin/fleet-copy", "--version"])
     print("Podman Quadlet generation, systemd units, and client APT install passed", flush=True)
 finally:
     mounts = [line.split()[4] for line in Path("/proc/self/mountinfo").read_text().splitlines()]

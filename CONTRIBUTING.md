@@ -6,7 +6,7 @@ Use Python 3.11 or newer. Run the portable tests and configuration validation:
 python3 -m pip install PyYAML
 PYTHONPATH=pxe_fleet python3 -m unittest discover -s tests -v
 PYTHONPATH=pxe_fleet python3 -m fleet.server --config examples/fleet.yaml --validate
-shellcheck pxe_fleet/assets/fleet-hook pxe_fleet/assets/fleet-nfsmount pxe_fleet/assets/fleet-nfs boot-media/*.sh boot-media/scripts/*.sh pxe_fleet/bootloader/build-tools.sh
+shellcheck pxe_fleet/assets/fleet-hook pxe_fleet/assets/fleet-nfsmount pxe_fleet/assets/fleet-nfs pxe_fleet/assets/fleet-ram-root boot-media/*.sh boot-media/scripts/*.sh pxe_fleet/bootloader/build-tools.sh
 docker build -t ha-pxe-fleet:test pxe_fleet
 ```
 
@@ -44,7 +44,10 @@ The network check requires the Linux host's NFS server and OverlayFS support.
 It verifies OS writes survive NFS remounts, separate appdata, late-server mount
 retries, TFTP, and actual Podman images/writable layers on an ext4 file opened
 through NFS. It unmounts/remounts the container filesystem and runs a saved image
-again. The image check verifies extraction, host-side package updates, boot-file
+again. It also copies a real NFS root to RAM using the initramfs helper, rejects
+an undersized RAM filesystem, checks link/permission preservation, disconnects
+all NFS mounts and stops the NFS server. It then executes code from the RAM root
+and a Podman container with a RAM appdata volume. The image check verifies extraction, host-side package updates, boot-file
 construction and staging, then checks that a second unchanged APT/image check
 reuses the prepared base without extraction or boot-file regeneration. The units check uses the
 real Podman generator and installs an APT application in an unpublished root.

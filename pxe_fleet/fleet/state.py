@@ -44,6 +44,11 @@ class Store:
             for client in cfg["clients"]:
                 serial = client["serial"]
                 entry = self.state["clients"].setdefault(serial, {"token": secrets.token_hex(32), "active": None, "previous": None, "pending": None, "failed": [], "last_seen": None})
+                mode = entry.setdefault("os_storage", entry.get("client", client).get("os_storage", "nfs"))
+                if client["os_storage"] != mode:
+                    LOG.warning("%s: ignoring os_storage=%s; this client was created with os_storage=%s", serial, client["os_storage"], mode)
+                # Normalize the configuration used by staging as well as state.
+                client["os_storage"] = mode
                 # Old roots and data are retained when clients are removed from config.
                 entry["client"] = client
                 (self.path / "appdata" / serial).mkdir(parents=True, exist_ok=True)
@@ -124,9 +129,11 @@ class Store:
             flavor = kernel_flavor(client["model"])
             shutil.copy2(boot / ("fleet-kernel-" + flavor), boot / "fleet-kernel")
             shutil.copy2(boot / ("fleet-initrd-" + flavor), boot / "fleet-initrd")
+            access = "ro" if spec["os_storage"] == "ram" else "rw"
             cmdline = (f"console=serial0,115200 console=tty1 root=/dev/nfs boot=fleet "
-                       f"nfsroot={cfg['server_ip']}:{self.nfs_root(serial, generation)},vers=4.1,proto=tcp,rw,hard "
-                       f"ip=dhcp rw rootwait panic=30\n")
+                       f"nfsroot={cfg['server_ip']}:{self.nfs_root(serial, generation)},vers=4.1,proto=tcp,{access},hard "
+                       f"ip=dhcp rw rootwait panic=30 fleet.os_storage={spec['os_storage']} "
+                       f"fleet.ram_root_size={spec['ram_root_size']}\n")
             atomic_write(boot / "cmdline.txt", cmdline)
             sd_payload(boot, client, generation)
             prepare_updates(root, spec)
@@ -257,7 +264,11 @@ class Store:
                     continue
                 generation = manifest.parent.name
                 fsid = int(digest([serial, generation])[:15], 16) + 1
-                lines.append(f"{pseudo / serial / 'roots' / generation} {ip}(rw,fsid={fsid},sync,no_subtree_check,no_root_squash,insecure)")
+                # Use the generation's mode, not newly edited desired config:
+                # a running NFS root must stay writable until its client reboots.
+                client = json.loads(manifest.read_text())["client"]
+                access = "ro" if client.get("os_storage", "nfs") == "ram" else "rw"
+                lines.append(f"{pseudo / serial / 'roots' / generation} {ip}({access},fsid={fsid},sync,no_subtree_check,no_root_squash,insecure)")
             fsid = int(digest([serial, 'appdata'])[:15], 16) + 1
             lines.append(f"{pseudo / serial / 'appdata'} {ip}(rw,fsid={fsid},sync,no_subtree_check,no_root_squash,insecure)")
         return "\n".join(lines) + "\n"

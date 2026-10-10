@@ -7,18 +7,25 @@ and loader update through A/B slots only when their contents change. The add-on 
 versioned Raspberry Pi OS Lite roots over NFSv4 and boot files over TFTP, and runs
 applications from signed APT repositories, OCI images using Podman, or both.
 
-The operating system is disposable and stored on a **writable NFS root** unique
-to each Pi and OS generation. Application data is a separate NFS mount. There is
-no RAM-backed OS overlay. System files, APT databases and client package updates
-persist on the server across ordinary reboots.
+Each client chooses its storage mode **when first registered**:
+
+- `os_storage: nfs` (default): a writable NFS OS root, separate persistent NFS
+  appdata, and Podman images on an ext4 file backed by NFS. Changes survive reboot.
+- `os_storage: ram`: the complete OS is copied into RAM during boot, then NFS is
+  unmounted. Appdata and Podman storage use separate RAM filesystems. Once apps
+  have started, an NFS/controller outage does not stop them. All runtime data and
+  updates disappear on reboot; every boot needs the server again.
+
+Later edits to `os_storage` are ignored and logged. Existing clients remain in
+NFS mode. There is no storage migration or RAM-to-NFS writeback. RAM mode needs
+space for the complete prepared OS, containers, application data and processes;
+use NFS mode on boards without sufficient memory.
 
 The add-on installs OS updates and initial APT applications on its own local disk,
-using QEMU when necessary. It publishes a new root and reboots the Pi after the
-build succeeds; it never runs host-side APT against a root being used by a client.
-Podman uses an ext4 disk-image file stored on the Pi's NFS appdata share, mounted
-at `/var/lib/containers`. Images and writable layers survive reboots and OS
-replacement. No local client disk or additional network protocol is required.
-Only normal runtime files, bounded logs, and reclaimable disk caches use RAM.
+using QEMU when necessary. It publishes a new generation and reboots the Pi after
+the build succeeds; it never runs host-side APT against a root used by a client.
+Neither mode needs local client storage. See the [storage settings](pxe_fleet/DOCS.md#client-storage-mode)
+for RAM limits and update behavior.
 
 ```mermaid
 flowchart LR
@@ -26,11 +33,11 @@ flowchart LR
     Apt[OS APT repositories] --> Cache
     Cache --> Build[Private host-side build with QEMU as needed]
     Build --> Boot[Matching immutable TFTP payload]
-    Build --> Root[Per-client writable NFS root]
-    Boot --> Pi[Pi running from NFS]
+    Build --> Root[Per-client OS generation]
+    Boot --> Pi[Pi boot]
     Root --> Pi
-    Pi --> Data[Separate appdata NFS mount]
-    Data --> Disk[ext4 file on NFS for Podman]
+    Pi --> NFS[NFS mode: persistent root, data and Podman]
+    Pi --> RAM[RAM mode: copy OS, disconnect NFS, volatile data and Podman]
 ```
 
 Every day by default, the add-on checks the official Lite image checksum and APT
@@ -43,7 +50,7 @@ An unchanged result creates no generation and requests no reboot.
 This uses checksum gating rather than guessing major versions from image filenames.
 A same-release image refresh with a new hash can therefore trigger a clean build;
 new major Raspberry Pi OS releases also do. APT applications and mutable container
-tags update hourly on clients, writing to disk-backed NFS storage.
+tags update hourly on clients, using their selected storage mode.
 
 **Experimental:** the automated checks exercise Linux image construction and
 network filesystems. Physical Pi boot and Home Assistant OS integration still

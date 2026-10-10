@@ -9,6 +9,11 @@ for module in nfs nfsv4 bcmgenet macb lan78xx smsc95xx usbnet dwc2 dwc_otg xhci_
     manual_add_modules "$module" || true
 done
 copy_exec /sbin/mount.nfs /sbin/mount.nfs
+# GNU cp preserves links, ownership, modes and xattrs when copying the complete
+# OS into RAM. Keep it separate from BusyBox's smaller cp implementation.
+copy_exec /bin/cp /bin/fleet-copy
+cp /usr/local/lib/fleet-ram-root "${DESTDIR}/bin/fleet-ram-root"
+chmod 755 "${DESTDIR}/bin/fleet-ram-root"
 # initramfs-tools' NFS script invokes klibc nfsmount, which only implements
 # NFSv2/v3. Use nfs-utils for NFSv4 and keep waiting for a late controller.
 rm -f "${DESTDIR}/bin/nfsmount"
